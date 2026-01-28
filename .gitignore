@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pkl
+*.log
+
+# Data (DO NOT COMMIT)
+data/
+*.tsv
+*.csv
+
+# OS
+.DS_Store
+
+# Virtual env
+venv/
+.env/
+
