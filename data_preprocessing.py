@@ -244,12 +244,35 @@ def build_combined_dataset(
     base_df = resolve_prompt8_traits(asap_df, base_df)
     print("✔ Finished resolving traits for prompt 8")
 
+    base_df = drop_score_domain2(base_df)
+    base_df = add_target_column(base_df)
+
     return base_df
 
 
 def save_tsv(df: pd.DataFrame, out_path: str) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True) if os.path.dirname(out_path) else None
     df.to_csv(out_path, sep="\t", index=False)
+
+def drop_score_domain2(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove score_domain2 if present."""
+    return df.drop(columns=["score_domain2"], errors="ignore")
+
+def make_target_dict_row(row: pd.Series) -> dict:
+    """
+    Build the target dict for one row.
+    Includes all unified traits + overall (score_domain1).
+    Keeps NaN as NaN (will become null if you later export to JSON).
+    """
+    target = {trait: row.get(trait, np.nan) for trait in UNIFIED_TRAITS}
+    target["overall"] = row.get("score_domain1", np.nan)
+    return target
+
+def add_target_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a 'target' column containing dicts: traits + overall."""
+    df = df.copy()
+    df["target"] = df.apply(make_target_dict_row, axis=1)
+    return df
 
 
 # -----------------------------
