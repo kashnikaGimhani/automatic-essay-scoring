@@ -16,3 +16,16 @@ data/
 venv/
 .env/
 
+# Model artifacts
+*.ckpt
+*.pt
+*.bin
+*.h5
+
+# Experiment outputs
+results/
+checkpoints/
+logs/
+wandb/
+runs/
+
