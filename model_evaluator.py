@@ -5,6 +5,9 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration  # T5 tokenizer
 from datasets import load_dataset  # HuggingFace Datasets: load TSV/CSV into Dataset objects and map preprocessing
 from utils.eval_qwk import Evaluator  # Your custom evaluator for QWK and trait parsing
 import argparse  # Read command-line arguments like --model_path, --data_path, etc.
+from torch.utils.data import DataLoader
+from transformers import DataCollatorForSeq2Seq
+
 
 def main():  # Main function to run evaluation end-to-end
     parser = argparse.ArgumentParser(description="Evaluate T5 for AES")  # Create CLI parser with a description
@@ -39,13 +42,14 @@ def main():  # Main function to run evaluation end-to-end
             "score the essay of the prompt " + str(prompts[i]) + ": " + inp  # e.g., "score the essay of the prompt 3: <essay>"
             for (i, inp) in enumerate(inputs)  # Loop with index to match prompts list
         ]
+
         model_inputs = tokenizer(  # Tokenize the input strings into token IDs
             inputs,  # List of instruction+essay strings
             max_length=512,  # Truncate/pad essay inputs to 512 tokens
             padding='max_length',  # Pad every example to exactly 512 tokens (simple but slower than dynamic padding)
             truncation=True  # Truncate if longer than max_length
         )
-
+        
         labels = tokenizer(  # Tokenize target score strings into label token IDs
             text_target=targets,  # This tells tokenizer these are target texts (labels) for seq2seq
             max_length=args.max_tgt_len,  # Max token length for label sequence (score text is short; this is usually overkill)
@@ -65,36 +69,71 @@ def main():  # Main function to run evaluation end-to-end
     model = model.to(device)
 
 
-    def test(tokenizer, device, test_set):  # Runs generation on one preprocessed Dataset chunk and returns decoded preds/targets
-        preds = model.generate(  # Generate output token IDs from the model (seq2seq decoding)
-            input_ids=torch.tensor(test_set["input_ids"]).to(device),  # Convert stored input_ids list -> tensor and move to device
-            attention_mask=torch.tensor(test_set["attention_mask"]).to(device),  # Convert attention_mask list -> tensor and move to device
-            max_length=args.max_tgt_len  # Maximum length of generated sequence (labels are padded to this too)
-        )
+    # def test(tokenizer, device, test_set):  # Runs generation on one preprocessed Dataset chunk and returns decoded preds/targets
+    #     preds = model.generate(  # Generate output token IDs from the model (seq2seq decoding)
+    #         input_ids=torch.tensor(test_set["input_ids"]).to(device),  # Convert stored input_ids list -> tensor and move to device
+    #         attention_mask=torch.tensor(test_set["attention_mask"]).to(device),  # Convert attention_mask list -> tensor and move to device
+    #         max_length=args.max_tgt_len  # Maximum length of generated sequence (labels are padded to this too)
+    #     )
 
-        predictions = preds  # Store generated sequences (token IDs) as predictions
-        label_ids = test_set['labels']  # Get label token IDs (padded to max_tgt_len)
+    #     predictions = preds  # Store generated sequences (token IDs) as predictions
+    #     label_ids = test_set['labels']  # Get label token IDs (padded to max_tgt_len)
 
-        assert len(predictions) == len(test_set)  # Sanity check: number of preds equals number of examples
-        assert len(predictions) == len(label_ids)  # Sanity check: preds length equals labels length
+    #     assert len(predictions) == len(test_set)  # Sanity check: number of preds equals number of examples
+    #     assert len(predictions) == len(label_ids)  # Sanity check: preds length equals labels length
 
-        predictions = torch.tensor(predictions).to(device, dtype=torch.long)  # Ensure predictions are long tensors on device
-        label_ids = torch.tensor(label_ids).to(device, dtype=torch.long)  # Ensure labels are long tensors on device
+    #     predictions = torch.tensor(predictions).to(device, dtype=torch.long)  # Ensure predictions are long tensors on device
+    #     label_ids = torch.tensor(label_ids).to(device, dtype=torch.long)  # Ensure labels are long tensors on device
 
-        results = [  # Decode each generated token sequence into text (e.g., "4")
-            tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True)  # Remove <pad>, </s>, etc.
-            for g in predictions  # Loop over each predicted sequence
-        ]
-        actuals = [  # Decode each label token sequence back into text (e.g., "4")
-            tokenizer.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            for t in label_ids  # Loop over each label sequence
-        ]
-        return results, actuals  # Return decoded predictions and decoded ground-truth scores (as strings)
+    #     results = [  # Decode each generated token sequence into text (e.g., "4")
+    #         tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True)  # Remove <pad>, </s>, etc.
+    #         for g in predictions  # Loop over each predicted sequence
+    #     ]
+    #     actuals = [  # Decode each label token sequence back into text (e.g., "4")
+    #         tokenizer.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+    #         for t in label_ids  # Loop over each label sequence
+    #     ]
+    #     return results, actuals  # Return decoded predictions and decoded ground-truth scores (as strings)
+
+    def test(tokenizer, device, test_set):
+        # Make sure dataset returns torch tensors
+        test_set = test_set.with_format("torch", columns=["input_ids", "attention_mask", "labels"])
+
+        collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+        loader = DataLoader(test_set, batch_size=args.test_batch, shuffle=False, collate_fn=collator)
+
+        results, actuals = [], []
+
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+
+                # IMPORTANT: use a small generation length for sanity eval
+                # If your transformers supports max_new_tokens, use it. Otherwise use max_length = input_len + N.
+                input_len = batch["input_ids"].shape[1]
+                gen_max_len = input_len + args.max_tgt_len  # behaves like max_new_tokens=args.max_tgt_len
+
+                generated = model.generate(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    max_length=gen_max_len,
+                    num_beams=1,                 # beam search increases memory; keep 1 for eval sanity
+                    do_sample=False,
+                    use_cache=True               # default; keep True
+                )
+
+                results.extend(tokenizer.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=True))
+                actuals.extend(tokenizer.batch_decode(batch["labels"], skip_special_tokens=True, clean_up_tokenization_spaces=True))
+
+        return results, actuals
+
+    
 
     predictions = []  # List to store decoded predictions across all chunks
     targets = []  # List to store decoded targets across all chunks
-    for list in test_set_list:  # Loop over each preprocessed chunk (20% splits)
-        pred, target = test(tokenizer, device, list)  # Run generation/eval on this chunk (device string 'cuda')
+    for chunk in test_set_list:  # Loop over each preprocessed chunk (20% splits)
+        pred, target = test(tokenizer, device, chunk)  # Run generation/eval on this chunk (device string 'cuda')
         predictions.extend(pred)  # Append this chunk's predictions to global list
         targets.extend(target)  # Append this chunk's targets to global list
 
@@ -104,10 +143,10 @@ def main():  # Main function to run evaluation end-to-end
     qwk_results = []  # Will store QWK results (per prompt) returned by Evaluator
     over_range = []  # Will store info about predictions that fall outside valid score ranges per trait
 
-    trait_1 = ['overall', 'content', 'word choice', 'organization', 'sentence fluency', 'conventions']  # Trait names for prompts using rubric set 1
-    trait_2 = ['overall', 'content', 'prompt adherence', 'language', 'narrativity']  # Trait names for rubric set 2
+    trait_1 = ['overall', 'content', 'word_choice', 'organization', 'sentence_fluency', 'conventions']  # Trait names for prompts using rubric set 1
+    trait_2 = ['overall', 'content', 'prompt_adherence', 'language', 'narrativity']  # Trait names for rubric set 2
     trait_3 = ['overall', 'content', 'organization', 'conventions', 'style']  # Trait names for rubric set 3
-    trait_4 = ['overall', 'content', 'word choice', 'organization', 'sentence fluency', 'conventions', 'voice']  # Trait names for rubric set 4
+    trait_4 = ['overall', 'content', 'word_choice', 'organization', 'sentence_fluency', 'conventions', 'voice']  # Trait names for rubric set 4
 
     trait_sets = [trait_1, trait_1, trait_2, trait_2, trait_2, trait_2, trait_3, trait_4]  # Map prompt 1..8 -> which trait list to use
     test_target = pd.read_csv(args.data_path + "/test.tsv", delimiter="\t")  # Load a CSV that contains prompt_id for each test example (NOTE: path/filename must match your data)
@@ -126,6 +165,15 @@ def main():  # Main function to run evaluation end-to-end
 
         preds = total_data[total_data['prompt'] == (i + 1)]['pred'].reset_index()['pred']  # Get preds for this prompt only
         tars = total_data[total_data['prompt'] == (i + 1)]['target'].reset_index()['target']  # Get targets for this prompt only
+
+        if i + 1 == 7:  # prompt 7
+            pred_df_dbg = QWK_EVAL.read_results(preds)
+            tar_df_dbg  = QWK_EVAL.read_results(tars)
+
+            print("Prompt7 parsed style valid targets:", (tar_df_dbg["style"] != -1).sum(), "/", len(tar_df_dbg))
+            print("Prompt7 parsed style valid preds:",   (pred_df_dbg["style"] != -1).sum(), "/", len(pred_df_dbg))
+            print("Sample parsed target style values:", tar_df_dbg["style"].head(10).tolist())
+            print("Sample raw target strings:", tars.iloc[:3].tolist())
 
         result = QWK_EVAL.evaluate_notnull(preds, tars)  # Compute QWK (and possibly trait-wise QWK) ignoring nulls
         pred_df = QWK_EVAL.read_results(preds)  # Parse predicted strings into structured columns for each trait (depends on your Evaluator format)

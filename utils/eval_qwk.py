@@ -5,6 +5,8 @@ import logging
 from sklearn.metrics import confusion_matrix, cohen_kappa_score, mean_squared_error
 from six import string_types
 import argparse
+import json
+import ast
 
 class Evaluator():
 
@@ -91,17 +93,17 @@ class Evaluator():
     
     def get_min_max_scores(self):
         return {
-        1: {'overall': (2, 12), 'content': (1, 6), 'organization': (1, 6), 'word choice': (1, 6),
-            'sentence fluency': (1, 6), 'conventions': (1, 6)},
-        2: {'overall': (1, 6), 'content': (1, 6), 'organization': (1, 6), 'word choice': (1, 6),
-            'sentence fluency': (1, 6), 'conventions': (1, 6)},
-        3: {'overall': (0, 3), 'content': (0, 3), 'prompt adherence': (0, 3), 'language': (0, 3), 'narrativity': (0, 3)},
-        4: {'overall': (0, 3), 'content': (0, 3), 'prompt adherence': (0, 3), 'language': (0, 3), 'narrativity': (0, 3)},
-        5: {'overall': (0, 4), 'content': (0, 4), 'prompt adherence': (0, 4), 'language': (0, 4), 'narrativity': (0, 4)},
-        6: {'overall': (0, 4), 'content': (0, 4), 'prompt adherence': (0, 4), 'language': (0, 4), 'narrativity': (0, 4)},
+        1: {'overall': (2, 12), 'content': (1, 6), 'organization': (1, 6), 'word_choice': (1, 6),
+            'sentence_fluency': (1, 6), 'conventions': (1, 6)},
+        2: {'overall': (1, 6), 'content': (1, 6), 'organization': (1, 6), 'word_choice': (1, 6),
+            'sentence_fluency': (1, 6), 'conventions': (1, 6)},
+        3: {'overall': (0, 3), 'content': (0, 3), 'prompt_adherence': (0, 3), 'language': (0, 3), 'narrativity': (0, 3)},
+        4: {'overall': (0, 3), 'content': (0, 3), 'prompt_adherence': (0, 3), 'language': (0, 3), 'narrativity': (0, 3)},
+        5: {'overall': (0, 4), 'content': (0, 4), 'prompt_adherence': (0, 4), 'language': (0, 4), 'narrativity': (0, 4)},
+        6: {'overall': (0, 4), 'content': (0, 4), 'prompt_adherence': (0, 4), 'language': (0, 4), 'narrativity': (0, 4)},
         7: {'overall': (0, 30), 'content': (0, 6), 'organization': (0, 6), 'conventions': (0, 6), 'style': (0,6)},
-        8: {'overall': (0, 60), 'content': (2, 12), 'organization': (2, 12), 'word choice': (2, 12),
-            'sentence fluency': (2, 12), 'conventions': (2, 12), 'voice': (2,12)}}
+        8: {'overall': (0, 60), 'content': (2, 12), 'organization': (2, 12), 'word_choice': (2, 12),
+            'sentence_fluency': (2, 12), 'conventions': (2, 12), 'voice': (2,12)}}
 
 
     def calc_kappa(self, pred, original, weight='quadratic'):
@@ -123,37 +125,98 @@ class Evaluator():
         return root_colwise_mse
     
 
+    # def read_results(self, pred):
+    #     results = pd.DataFrame(columns=self.traits)
+    #     for i in range(len(pred)):
+    #         text = str(pred[i])
+    #         scores_list = text.split(", ") # , 기준으로 분리
+
+    #         trait_scores = []
+    #         for trait in self.traits:
+    #             score = [re.search(r'\d+|nan', s) for s in scores_list if trait in s]
+    #             if len(score)<1 or (None in score):
+    #                 trait_score = -1
+    #             else:
+    #                 trait_score = score[0][0]
+    #                 if len(score)>1:
+    #                     print("%d idx text has %s score length %d."%(i,trait, len(score)))
+    #                     print(score)
+    #             trait_scores.append(trait_score)
+
+    #         assert len(self.traits)==len(trait_scores), 'trait length error!'
+    #         results.loc[i] = trait_scores
+            
+    #         results = results.astype('float')
+    #         results = results.fillna(value=-1)
+            
+    #     return results
+
     def read_results(self, pred):
         results = pd.DataFrame(columns=self.traits)
+
         for i in range(len(pred)):
-            text = str(pred[i])
-            scores_list = text.split(", ") # , 기준으로 분리
+            text = str(pred[i]).strip()
+
+            # 1) Normalize "nan" so parsers don't choke
+            safe = re.sub(r"\bnan\b", "None", text, flags=re.IGNORECASE)
+
+            # 2) If it looks like key:value pairs but missing braces, wrap it
+            if ":" in safe and not safe.lstrip().startswith("{"):
+                safe = "{" + safe + "}"
+
+            obj = None
+            # 3) Try JSON first, then python literal dict
+            try:
+                obj = json.loads(safe)
+            except Exception:
+                try:
+                    obj = ast.literal_eval(safe)
+                except Exception:
+                    obj = None
 
             trait_scores = []
-            for trait in self.traits:
-                score = [re.search(r'\d+|nan', s) for s in scores_list if trait in s]
-                if len(score)<1 or (None in score):
-                    trait_score = -1
-                else:
-                    trait_score = score[0][0]
-                    if len(score)>1:
-                        print("%d idx text has %s score length %d."%(i,trait, len(score)))
-                        print(score)
-                trait_scores.append(trait_score)
 
-            assert len(self.traits)==len(trait_scores), 'trait length error!'
+            # 4) If parsed as dict, read values by key
+            if isinstance(obj, dict):
+                for trait in self.traits:
+                    # allow both style / "style", word_choice / "word choice"
+                    v = obj.get(trait)
+                    if v is None:
+                        alt = trait.replace("_", " ") if "_" in trait else trait.replace(" ", "_")
+                        v = obj.get(alt, None)
+
+                    if v is None:
+                        trait_scores.append(-1)
+                    else:
+                        try:
+                            trait_scores.append(float(v))
+                        except Exception:
+                            trait_scores.append(-1)
+
+            # 5) Fallback: regex extract "trait: value" (handles missing spaces after commas)
+            else:
+                for trait in self.traits:
+                    m = re.search(
+                        rf"{re.escape(trait)}\s*['\"]?\s*:\s*(nan|-?\d+(?:\.\d+)?)",
+                        text,
+                        flags=re.IGNORECASE
+                    )
+                    if (m is None) or (m.group(1).lower() == "nan"):
+                        trait_scores.append(-1)
+                    else:
+                        trait_scores.append(float(m.group(1)))
+
+            assert len(self.traits) == len(trait_scores), "trait length error!"
             results.loc[i] = trait_scores
-            
-            results = results.astype('float')
-            results = results.fillna(value=-1)
-            
+
+        results = results.astype("float").fillna(-1)
         return results
     
     def read_results_norm(self, pred):
         results = pd.DataFrame(columns=self.traits)
         for i in range(len(pred)):
             text = str(pred[i])
-            scores_list = text.split(", ") # , 기준으로 분리
+            scores_list = text.split(", ") 
 
             trait_scores = []
             for trait in self.traits:
@@ -200,19 +263,39 @@ class Evaluator():
         print('Trait ',trait, 'QWK score: ', qwk)
         return qwk
     
+    # def evaluate_notnull(self, pred, target):
+    #     results = self.read_results(pred)
+    #     targets = self.read_results(target)
+        
+    #     qwk_results = {}
+    #     for key in results.keys():
+    #         trait_tgt = targets[key][targets[key]!=-1]
+    #         print('len: ', len(trait_tgt))
+    #         trait_pred = results[key][trait_tgt.index] # evaluate only the samples whose ground-truth values are not null
+    #         qwk = self.calc_kappa(trait_pred, trait_tgt)
+    #         qwk_results[key] = qwk
+
+    #     return qwk_results
+
     def evaluate_notnull(self, pred, target):
         results = self.read_results(pred)
         targets = self.read_results(target)
-        
+
         qwk_results = {}
         for key in results.keys():
-            trait_tgt = targets[key][targets[key]!=-1]
-            print('len: ', len(trait_tgt))
-            trait_pred = results[key][trait_tgt.index] # evaluate only the samples whose ground-truth values are not null
+            trait_tgt = targets[key][targets[key] != -1]
+
+            # ✅ Skip if there are no valid target labels for this trait
+            if len(trait_tgt) == 0:
+                qwk_results[key] = None  # or np.nan
+                continue
+
+            trait_pred = results[key][trait_tgt.index]
             qwk = self.calc_kappa(trait_pred, trait_tgt)
             qwk_results[key] = qwk
 
         return qwk_results
+
     
     def evaluate_notnull_norm(self, pred, target, prompt):
         results = self.read_results_norm(pred)

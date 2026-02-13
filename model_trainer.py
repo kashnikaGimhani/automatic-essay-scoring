@@ -52,8 +52,8 @@ def main():
     validation_set = dataset['valid'].map(preprocess_function, batched=True)
 
     # For sanity checks only - remove for final training
-    training_set = training_set.select(range(500))
-    validation_set = validation_set.select(range(200))
+    # training_set = training_set.select(range(500))
+    # validation_set = validation_set.select(range(200))
 
 
     # Define the training arguments
@@ -78,8 +78,8 @@ def main():
         save_strategy = "steps", # 'steps' 
         load_best_model_at_end=True,
         generation_max_length=args.max_tgt_len,
-        #predict_with_generate=True,
-        predict_with_generate=False, # For sanity checks only - remove for final training
+        predict_with_generate=True,
+        #predict_with_generate=False, # For sanity checks only - remove for final training
         save_total_limit = 2
     )
     
@@ -90,7 +90,7 @@ def main():
         train_dataset=training_set,
         eval_dataset=validation_set,
         tokenizer=tokenizer,
-        # callbacks = [EarlyStoppingCallback(early_stopping_patience=2)] # for sanity checks only - remove for final training
+        callbacks = [EarlyStoppingCallback(early_stopping_patience=2)] # for sanity checks only - uncomment for final training
         #compute_metrics=compute_metrics(tokenizer=tokenizer),
     )
     

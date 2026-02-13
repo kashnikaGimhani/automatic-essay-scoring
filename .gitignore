@@ -28,4 +28,7 @@ checkpoints/
 logs/
 wandb/
 runs/
+results_sanity/
+outputs/
+outputs_sanity/
 

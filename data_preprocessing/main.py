@@ -6,7 +6,7 @@ Runs:
 2) 5-fold cross-validation split creation
 """
 
-from data_preprocessing import (
+from data_preprocessing.data_preprocessing import (
     build_combined_dataset,
     save_tsv,
     PromptTraitFile

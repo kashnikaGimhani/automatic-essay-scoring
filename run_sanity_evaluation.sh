@@ -8,11 +8,11 @@ set -e
 EVAL_SCRIPT="model_evaluator.py"
 DATA_PATH="data/5fold_cv/fold_1"
 MODEL_PATH="./results/fold_1/checkpoint-250"      # <-- change to your checkpoint folder
-OUT_PATH="./output/sanity_eval_fold_1"           # creates output file: sanity_eval_fold_1.csv
+OUT_PATH="./outputs/sanity_eval_fold_1"           # creates output file: sanity_eval_fold_1.csv
 SANITY_SPLIT="train[:5%]"
 
 # Sanity settings (fast)
-MAX_TGT_LEN=64
+MAX_TGT_LEN=256
 TEST_BATCH=2
 
 python3 "$EVAL_SCRIPT" \
