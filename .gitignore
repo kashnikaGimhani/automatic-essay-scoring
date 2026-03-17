@@ -31,4 +31,7 @@ runs/
 results_sanity/
 outputs/
 outputs_sanity/
+results_finetune_baseline/
+results_meta_aes/
+results_small_lora_asaptraits/
 

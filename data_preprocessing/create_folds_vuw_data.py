@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Create 5 repeated (fold_1..fold_5) 60/20/20 train/dev/test splits from a small dataset.
-
-This is NOT classic disjoint k-fold CV; it is 5 repeated stratified random splits
-(Monte-Carlo CV style), which is usually more stable for tiny datasets.
-
-Key points:
-- Stratification label is computed overall = round(mean of 5 traits)
-  (ideas, flow, coherence, vocab, grammar)
-- Rare classes are merged *only for stratification* so StratifiedShuffleSplit won't fail.
-- Saves: output_dir/fold_i/{train.tsv, dev.tsv, test.tsv}
-
-Expected columns:
-  id, essay, ideas, flow, coherence, vocab, grammar, overall_score
-(overall_score is not used for stratification; we recompute from traits)
-"""
-
 import os
 import argparse
 import re
@@ -29,11 +12,15 @@ REQUIRED_COLS = ["id", "essay", "ideas", "flow", "coherence", "vocab", "grammar"
 
 def clean_text(x: str) -> str:
     x = str(x)
-    return re.sub(r"\s+", " ", x).strip()
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
 
 
 def compute_overall_from_traits(df: pd.DataFrame) -> pd.Series:
-    """overall = round(mean of the 5 trait columns)."""
+    """
+    Computes overall = round(mean of trait scores).
+    This matches your dataset rule and avoids relying on overall_score column.
+    """
     return (
         df[["ideas", "flow", "coherence", "vocab", "grammar"]]
         .astype(float)
@@ -43,32 +30,6 @@ def compute_overall_from_traits(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def merge_rare_classes(y: np.ndarray, min_count: int = 3) -> np.ndarray:
-    """
-    Merge classes with count < min_count into a neighboring class (ordinal).
-    This is used ONLY to create stable stratification labels.
-    """
-    y = np.asarray(y).astype(int).copy()
-    vc = pd.Series(y).value_counts()
-
-    # Keep merging until all classes have enough samples
-    while len(vc) > 1 and vc.min() < min_count:
-        rare_cls = int(vc.idxmin())
-
-        # neighbor candidates that exist
-        candidates = [c for c in [rare_cls - 1, rare_cls + 1] if c in vc.index]
-        if not candidates:
-            break
-
-        # merge into the neighbor with the larger count
-        neighbor = max(candidates, key=lambda c: vc[c])
-        y[y == rare_cls] = neighbor
-
-        vc = pd.Series(y).value_counts()
-
-    return y
-
-
 def stratified_split_60_20_20(df: pd.DataFrame, strat_labels: np.ndarray, seed: int):
     """
     60/20/20 stratified split:
@@ -76,20 +37,23 @@ def stratified_split_60_20_20(df: pd.DataFrame, strat_labels: np.ndarray, seed: 
       dev   = 20%
       test  = 20%
     Done as: (train vs temp=40%), then (dev vs test) from temp.
-    """
-    idx = np.arange(len(df))
 
-    # Split 1: train (60%) / temp (40%)
+    Using 3-bin strat labels makes this stable for tiny datasets.
+    """
+    n = len(df)
+    idx = np.arange(n)
+
+    # First split: train(60) / temp(40)
     sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.4, random_state=seed)
     train_idx, temp_idx = next(sss1.split(idx, strat_labels))
 
-    # Split 2: dev (20%) / test (20%) from temp (50/50 of temp)
+    # Second split: dev(20) / test(20) from temp (50/50 of temp)
     temp_labels = strat_labels[temp_idx]
     sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.5, random_state=seed + 999)
-    dev_rel, test_rel = next(sss2.split(np.arange(len(temp_idx)), temp_labels))
+    dev_rel_idx, test_rel_idx = next(sss2.split(np.arange(len(temp_idx)), temp_labels))
 
-    dev_idx = temp_idx[dev_rel]
-    test_idx = temp_idx[test_rel]
+    dev_idx = temp_idx[dev_rel_idx]
+    test_idx = temp_idx[test_rel_idx]
 
     return (
         df.iloc[train_idx].reset_index(drop=True),
@@ -105,12 +69,9 @@ def main():
     ap.add_argument("--output_dir", type=str, default="./data_small_folds", help="Output dir.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n_folds", type=int, default=5)
-    ap.add_argument("--min_class_count", type=int, default=3,
-                    help="Minimum count per class for stratification labels (rare classes merged).")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-
     df = pd.read_csv(args.data_path, sep=args.sep)
 
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
@@ -121,20 +82,25 @@ def main():
     df["essay"] = df["essay"].apply(clean_text)
     df = df[df["essay"].str.len() > 0].reset_index(drop=True)
 
-    # Compute stratification labels from traits (not from overall_score column)
-    overall = compute_overall_from_traits(df)
-    strat = merge_rare_classes(overall.to_numpy(), min_count=args.min_class_count)
+    # ---- Stratification labels (3-bin, stable) ----
+    # overall = round(mean of trait scores)
+    overall = compute_overall_from_traits(df).to_numpy()
 
-    # Print distributions (useful sanity check)
-    print("Overall-from-traits distribution (raw):")
-    print(overall.value_counts().sort_index())
-    print("\nStrat-label distribution (after rare-class merge):")
+    # 3 bins:
+    #   0 = low (<=3)
+    #   1 = mid (=4)
+    #   2 = high (>=5)
+    strat = np.where(overall <= 3, 0, np.where(overall == 4, 1, 2))
+
+    # Print distributions for sanity
+    print("Computed overall (from traits) distribution:")
+    print(pd.Series(overall).value_counts().sort_index())
+    print("\n3-bin strat distribution:")
     print(pd.Series(strat).value_counts().sort_index())
     print("")
 
     for fold in range(1, args.n_folds + 1):
         fold_seed = args.seed + fold * 100
-
         train_df, dev_df, test_df = stratified_split_60_20_20(df, strat, seed=fold_seed)
 
         fold_dir = os.path.join(args.output_dir, f"fold_{fold}")
@@ -146,7 +112,7 @@ def main():
 
         print(f"[fold {fold}] train={len(train_df)} dev={len(dev_df)} test={len(test_df)} -> {fold_dir}")
 
-    print("\n✅ Created folds with stratified 60/20/20 train/dev/test splits.")
+    print("\n✅ Created 5 folds with stratified 60/20/20 train/dev/test per fold (3-bin strat).")
 
 
 if __name__ == "__main__":
