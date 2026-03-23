@@ -114,6 +114,13 @@ def main():
 
     print("\n✅ Created 5 folds with stratified 60/20/20 train/dev/test per fold (3-bin strat).")
 
+# python3 create_small_folds.py \
+#   --data_path ../data/vuw_data/113_copy.tsv \
+#   --sep $'\t' \
+#   --output_dir ../data/vuw_data_folds_v2 \
+#   --seed 42 \
+#   --n_folds 5
+
 
 if __name__ == "__main__":
     main()

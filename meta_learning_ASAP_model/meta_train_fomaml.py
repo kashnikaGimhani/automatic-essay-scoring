@@ -1,51 +1,39 @@
-print("Script file started", flush=True)
-
 import os
-print("Imported os", flush=True)
-
 import json
-print("Imported json", flush=True)
-
 import random
-print("Imported random", flush=True)
-
 import argparse
-print("Imported argparse", flush=True)
-
-from copy import deepcopy
-print("Imported deepcopy", flush=True)
-
+from collections import OrderedDict
 from typing import Dict, List, Tuple
-print("Imported typing", flush=True)
 
 import numpy as np
-print("Imported numpy", flush=True)
-
 import pandas as pd
-print("Imported pandas", flush=True)
-
 import torch
-print("Imported torch", flush=True)
-
 import torch.nn as nn
-print("Imported torch.nn", flush=True)
-
 import torch.nn.functional as F
-print("Imported torch.nn.functional", flush=True)
 
 from transformers import (
     set_seed,
     T5Tokenizer,
     T5ForConditionalGeneration,
 )
-print("Imported transformers", flush=True)
+
+try:
+    from torch.func import functional_call
+except ImportError:
+    raise ImportError(
+        "This script requires torch.nn.utils.stateless.functional_call. "
+        "Please use a compatible PyTorch version."
+    )
+
+from sklearn.metrics import cohen_kappa_score
+
+print("Imports completed", flush=True)
 
 
 # =========================================================
 # CONSTANTS
-# These are reused from your alignment fine-tuning script
-# so the prompt descriptions, rubric text, and score ranges
-# stay consistent across alignment + meta-training.
+# Reused from your alignment script so prompt descriptions,
+# rubric text, and score ranges remain consistent.
 # =========================================================
 
 PROMPT_DESCRIPTIONS = {
@@ -132,57 +120,45 @@ TRAIT_COLUMNS = [
     "voice",
 ]
 
-from sklearn.metrics import cohen_kappa_score
-
 
 # =========================================================
-# ARGUMENT PARSING
-# This keeps training settings configurable from CLI so you
-# can change support/query size, trainable mode, prompt split,
-# learning rates, etc. without editing the script each time.
+# ARGUMENTS
 # =========================================================
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Meta-training for AES using a first practical episodic version before true FOMAML."
+        description="True first-order MAML style meta-training for AES."
     )
 
-    # Input data path and aligned checkpoint path
     parser.add_argument("--train_file", type=str, required=True, help="Path to ASAP TSV/CSV file.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to alignment finetuned checkpoint.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save outputs.")
 
-    # General settings
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_input_len", type=int, default=768)
 
-    # Prompt split used to simulate cross-prompt transfer
     parser.add_argument("--train_prompts", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6])
-    parser.add_argument("--val_prompts", type=int, nargs="+", default=[7])
-    parser.add_argument("--test_prompts", type=int, nargs="+", default=[8])
+    parser.add_argument("--val_prompts", type=int, nargs="+", default=[8])
+    parser.add_argument("--test_prompts", type=int, nargs="+", default=[7])
 
-    # Optional balancing to avoid some prompt/trait groups dominating training
-    parser.add_argument("--max_samples_per_group_train", type=int, default=1000)
-    parser.add_argument("--max_samples_per_group_val", type=int, default=500)
-    parser.add_argument("--max_samples_per_group_test", type=int, default=500)
+    parser.add_argument("--max_samples_per_group_train", type=int, default=300)
+    parser.add_argument("--max_samples_per_group_val", type=int, default=100)
+    parser.add_argument("--max_samples_per_group_test",type=int,default=None,help="Limit number of samples per (prompt, trait) group for test set")
 
-    # Meta-learning episode settings
     parser.add_argument("--support_size", type=int, default=8)
     parser.add_argument("--query_size", type=int, default=16)
     parser.add_argument("--tasks_per_meta_batch", type=int, default=4)
-    parser.add_argument("--meta_steps", type=int, default=2000)
+    parser.add_argument("--meta_steps", type=int, default=1000)
 
-    # Inner-loop and outer-loop settings
     parser.add_argument("--inner_steps", type=int, default=1)
     parser.add_argument("--inner_lr", type=float, default=1e-3)
     parser.add_argument("--meta_lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    # Which parameters to train in this first version
     parser.add_argument("--trainable_mode", type=str, default="head", choices=["head", "last_k", "all"])
     parser.add_argument("--unfreeze_last_k", type=int, default=2)
 
-    # Validation / logging frequency
     parser.add_argument("--val_every", type=int, default=100)
     parser.add_argument("--val_episodes", type=int, default=100)
     parser.add_argument("--test_episodes", type=int, default=200)
@@ -192,10 +168,9 @@ def parse_args():
 
 
 # =========================================================
-# SEED SETUP
-# Sets all major random sources so sampling and training
-# are more reproducible across runs.
+# HELPERS
 # =========================================================
+
 def setup_seed(seed: int):
     set_seed(seed)
     random.seed(seed)
@@ -205,11 +180,6 @@ def setup_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# =========================================================
-# DATA LOADING
-# Tries CSV first, then TSV fallback, because some ASAP files
-# are stored in tab-separated format.
-# =========================================================
 def load_table(path: str) -> pd.DataFrame:
     try:
         return pd.read_csv(path)
@@ -217,69 +187,24 @@ def load_table(path: str) -> pd.DataFrame:
         return pd.read_csv(path, sep="\t")
 
 
-# =========================================================
-# SCORE NORMALIZATION
-# Converts raw rubric score into [0,1] normalized range so
-# all traits/prompts can be trained on a common scale.
-# =========================================================
 def normalize_score(score: float, min_score: float, max_score: float) -> float:
     if max_score == min_score:
         return 0.0
     return (score - min_score) / (max_score - min_score)
 
-def denormalize_score(score_norm: float, min_score: float, max_score: float) -> float:
-    return score_norm * (max_score - min_score) + min_score
 
-
-def clamp_and_round_score(score_raw: float, min_score: float, max_score: float) -> int:
-    return int(np.clip(np.round(score_raw), min_score, max_score))
-
-
-def compute_qwk(y_true: List[int], y_pred: List[int]) -> float:
-    """
-    Quadratic Weighted Kappa for integer labels.
-    """
-    if len(y_true) == 0:
-        return float("nan")
-
-    # If all labels collapse to one value in a tiny episode, sklearn can behave oddly.
-    # This keeps it safe.
-    unique_labels = sorted(set(y_true) | set(y_pred))
-    if len(unique_labels) <= 1:
-        return 1.0
-
-    return float(cohen_kappa_score(y_true, y_pred, labels=unique_labels, weights="quadratic"))
-
-
-# =========================================================
-# INFER SCORE RANGES
-# If a trait/prompt pair is not found in the hardcoded mapping,
-# this estimates its min/max score range from the dataset.
-# =========================================================
-def infer_score_ranges(df: pd.DataFrame, trait_columns: List[str]) -> Dict[Tuple[int, str], Tuple[float, float]]:
+def infer_score_ranges(df: pd.DataFrame, trait_columns: List[str]) -> Dict[Tuple[int, str], Tuple[float, float]]: #need to use the predefined min max score ranges
     score_ranges = {}
-
-    # Loop through each prompt/essay_set
     for essay_set in sorted(df["essay_set"].dropna().unique()):
         df_set = df[df["essay_set"] == essay_set]
-
-        # For each trait, inspect available scores and infer min/max
         for trait in trait_columns:
             if trait in df_set.columns:
                 values = df_set[trait].dropna().astype(float)
                 if len(values) > 0:
                     score_ranges[(int(essay_set), trait)] = (float(values.min()), float(values.max()))
-
     return score_ranges
 
 
-# =========================================================
-# GET SCORE RANGE
-# Returns the score range for a given (essay_set, trait) pair.
-# Priority:
-# 1. predefined SCORE_RANGES
-# 2. inferred ranges from the data
-# =========================================================
 def get_score_range(
     essay_set: int,
     trait: str,
@@ -292,12 +217,6 @@ def get_score_range(
     raise ValueError(f"No score range found for essay_set={essay_set}, trait={trait}")
 
 
-# =========================================================
-# BUILD INPUT TEXT
-# Creates the exact input prompt given to the model.
-# This matches your alignment stage style, so meta-learning
-# continues from the same prompt-conditioned formulation.
-# =========================================================
 def build_input_text(
     essay_text: str,
     essay_set: int,
@@ -318,16 +237,6 @@ def build_input_text(
     )
 
 
-# =========================================================
-# WIDE -> LONG CONVERSION
-# Converts the original ASAP-style row format:
-#   essay | content | organization | ...
-# into trait-wise training rows:
-#   essay | trait | score_norm | input_text
-#
-# This is essential because each meta-task is defined as:
-#   task = (essay_set, trait)
-# =========================================================
 def wide_to_long_with_norm(
     df: pd.DataFrame,
     trait_columns: List[str],
@@ -335,13 +244,11 @@ def wide_to_long_with_norm(
 ) -> pd.DataFrame:
     records = []
 
-    # Loop over essays in the original dataframe
     for _, row in df.iterrows():
         essay_id = row["essay_id"]
         essay_set = int(row["essay_set"])
         essay_text = str(row["essay"])
 
-        # For each essay, create one row per available trait
         for trait in trait_columns:
             if trait in df.columns and pd.notna(row[trait]):
                 raw_score = float(row[trait])
@@ -373,16 +280,10 @@ def wide_to_long_with_norm(
     return pd.DataFrame(records)
 
 
-# =========================================================
-# BALANCED SUBSET
-# Limits the number of examples per (essay_set, trait) group.
-# This helps avoid large groups dominating the episodic pool.
-# =========================================================
 def balanced_subset(df_long: pd.DataFrame, max_per_group: int, seed: int) -> pd.DataFrame:
     parts = []
     grouped = df_long.groupby(["essay_set", "trait"])
 
-    # Process each prompt-trait group separately
     for _, group_df in grouped:
         if len(group_df) > max_per_group:
             group_df = group_df.sample(max_per_group, random_state=seed)
@@ -391,49 +292,91 @@ def balanced_subset(df_long: pd.DataFrame, max_per_group: int, seed: int) -> pd.
     if len(parts) == 0:
         raise ValueError("No data available after grouping.")
 
-    # Shuffle the final concatenated dataframe
     return pd.concat(parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
-# =========================================================
-# SAMPLE WITHOUT REPLACEMENT
-# Used during episodic construction so support/query samples
-# do not duplicate within one episode.
-# =========================================================
 def sample_without_replacement(indices: List[int], n: int) -> List[int]:
     if len(indices) < n:
         raise ValueError(f"Not enough samples. Need {n}, found {len(indices)}")
     return random.sample(indices, n)
 
+def denormalize_score(score_norm: float, min_score: float, max_score: float) -> float:
+    """
+    Convert normalized score back to original score range.
+    """
+    return score_norm * (max_score - min_score) + min_score
+
+
+def restore_valid_score(score_norm: float, min_score: float, max_score: float) -> int:
+    """
+    Convert normalized score to a valid integer score:
+    1. denormalize
+    2. clamp to valid range
+    3. round to nearest integer
+    """
+    raw_score = denormalize_score(score_norm, min_score, max_score)
+    raw_score = max(min_score, min(max_score, raw_score))
+    return int(round(raw_score))
+
+
+def compute_qwk_from_records(records: List[Dict]) -> Dict[str, float]:
+    """
+    Compute QWK separately for each (essay_set, trait) group,
+    then return mean QWK across groups.
+    """
+    if len(records) == 0:
+        return {
+            "mean_qwk": 0.0,
+            "group_qwks": {},
+        }
+
+    df_tmp = pd.DataFrame(records)
+
+    group_qwks = {}
+    qwk_values = []
+
+    for (essay_set, trait), group_df in df_tmp.groupby(["essay_set", "trait"]):
+        min_score = float(group_df["min_score"].iloc[0])
+        max_score = float(group_df["max_score"].iloc[0])
+
+        y_true = [
+            restore_valid_score(v, min_score, max_score)
+            for v in group_df["true_norm"].astype(float).tolist()
+        ]
+        y_pred = [
+            restore_valid_score(v, min_score, max_score)
+            for v in group_df["pred_norm"].astype(float).tolist()
+        ]
+
+        qwk = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+        if pd.isna(qwk):
+            qwk = 0.0
+
+        key = f"prompt_{essay_set}_{trait}"
+        group_qwks[key] = float(qwk)
+        qwk_values.append(float(qwk))
+
+    mean_qwk = float(np.mean(qwk_values)) if len(qwk_values) > 0 else 0.0
+
+    return {
+        "mean_qwk": mean_qwk,
+        "group_qwks": group_qwks,
+    }
+
 
 # =========================================================
 # MODEL
-# This first meta-training version uses:
-#   T5 encoder + regression head
-#
-# Why:
-# - easier inner-loop optimization
-# - more stable than token generation for meta-learning
-# - still uses the alignment checkpoint weights
-#
-# NOTE:
-# This is a design change from the alignment stage.
-# Alignment used text generation; meta-training here uses
-# regression on normalized score.
+# T5 encoder + regression head
+# This stays the same as your current meta script.
 # =========================================================
-class T5EncoderRegressor(nn.Module):
-    """
-    Uses encoder representations from T5 and predicts a single normalized score.
-    """
 
+class T5EncoderRegressor(nn.Module):
     def __init__(self, model_path: str):
         super().__init__()
 
-        # Load the previously aligned T5 checkpoint
         self.t5 = T5ForConditionalGeneration.from_pretrained(model_path)
         hidden_size = self.t5.config.d_model
 
-        # Small regression head placed on top of pooled encoder output
         self.regressor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
@@ -441,66 +384,47 @@ class T5EncoderRegressor(nn.Module):
             nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, input_ids, attention_mask):
-        # Encode input text using the T5 encoder only
+    def _forward_impl(self, input_ids, attention_mask):
         enc_out = self.t5.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
         )
-        hidden = enc_out.last_hidden_state  # [B, T, H]
+        hidden = enc_out.last_hidden_state
 
-        # Mean-pool token embeddings using attention mask
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
 
-        # Predict a scalar normalized score
         pred = self.regressor(pooled)
-
-        # Keep output in [0, 1] because targets are normalized
         pred = torch.sigmoid(pred)
         return pred
 
+    def forward(self, input_ids, attention_mask):
+        return self._forward_impl(input_ids, attention_mask)
 
-# =========================================================
-# TRAINABLE PARAMETER SELECTION
-# Controls which model parts are updated in the outer loop.
-#
-# Modes:
-# - head: only regression head
-# - last_k: regression head + last K encoder blocks
-# - all: full encoder + head
-#
-# For first experiments, "head" is safest and cheapest.
-# =========================================================
+
 def set_trainable_params(model: T5EncoderRegressor, mode: str, unfreeze_last_k: int):
-    # Freeze everything first
     for p in model.parameters():
         p.requires_grad = False
 
     if mode == "head":
-        # Train only the regression head
         for p in model.regressor.parameters():
             p.requires_grad = True
 
     elif mode == "last_k":
-        # Train regression head
         for p in model.regressor.parameters():
             p.requires_grad = True
 
-        # Unfreeze the last K encoder blocks
         blocks = model.t5.encoder.block
         k = min(unfreeze_last_k, len(blocks))
         for block in blocks[-k:]:
             for p in block.parameters():
                 p.requires_grad = True
 
-        # Also unfreeze final layer norm for encoder
         for p in model.t5.encoder.final_layer_norm.parameters():
             p.requires_grad = True
 
     elif mode == "all":
-        # Train the full encoder and regression head
         for p in model.t5.encoder.parameters():
             p.requires_grad = True
         for p in model.regressor.parameters():
@@ -512,16 +436,10 @@ def set_trainable_params(model: T5EncoderRegressor, mode: str, unfreeze_last_k: 
 
 # =========================================================
 # EPISODIC DATASET
-# Groups trait-wise rows into tasks:
+# Groups long-format rows into tasks:
 #   task = (essay_set, trait)
-#
-# Each sampled episode contains:
-# - support batch
-# - query batch
-#
-# This matches the meta-learning setting where the model
-# adapts on support and is evaluated on query.
 # =========================================================
+
 class EpisodicAESDataset:
     def __init__(
         self,
@@ -539,15 +457,12 @@ class EpisodicAESDataset:
         self.query_size = query_size
         self.device = device
 
-        # Map each task to the row indices belonging to that task
         self.task_to_indices: Dict[Tuple[int, str], List[int]] = {}
 
-        # Build task index mapping
         for idx, row in self.df.iterrows():
             task = (int(row["essay_set"]), str(row["trait"]))
             self.task_to_indices.setdefault(task, []).append(idx)
 
-        # Keep only tasks that have enough examples for one full episode
         self.tasks = [
             task for task, idxs in self.task_to_indices.items()
             if len(idxs) >= (self.support_size + self.query_size)
@@ -560,22 +475,14 @@ class EpisodicAESDataset:
             )
 
     def sample_task_batch(self, num_tasks: int) -> List[Tuple[int, str]]:
-        """
-        Samples multiple tasks for one outer meta-batch.
-        If there are not enough unique tasks, sampling falls back to replacement.
-        """
         if len(self.tasks) >= num_tasks:
             return random.sample(self.tasks, num_tasks)
         return random.choices(self.tasks, k=num_tasks)
 
-    def sample_episode(self, task: Tuple[int, str]) -> Dict[str, torch.Tensor]:
-        """
-        Samples one support/query split for a given task.
-        """
+    def sample_episode(self, task: Tuple[int, str]) -> Dict[str, Dict[str, torch.Tensor]]:
         indices = self.task_to_indices[task]
         chosen = sample_without_replacement(indices, self.support_size + self.query_size)
 
-        # First part becomes support, second part becomes query
         support_indices = chosen[:self.support_size]
         query_indices = chosen[self.support_size:]
 
@@ -588,10 +495,6 @@ class EpisodicAESDataset:
         }
 
     def _encode_batch(self, batch_df: pd.DataFrame) -> Dict[str, torch.Tensor]:
-        """
-        Tokenizes a batch of text prompts and returns tensors plus normalized scores.
-        Also returns metadata needed for denormalization + QWK computation.
-        """
         texts = batch_df["input_text"].tolist()
         scores = batch_df["score_norm"].astype(float).tolist()
 
@@ -608,220 +511,218 @@ class EpisodicAESDataset:
             "attention_mask": enc["attention_mask"].to(self.device),
             "scores": torch.tensor(scores, dtype=torch.float32, device=self.device).unsqueeze(-1),
 
-            # metadata for evaluation
+            # metadata for QWK
             "essay_set": batch_df["essay_set"].astype(int).tolist(),
             "trait": batch_df["trait"].astype(str).tolist(),
-            "raw_score": batch_df["raw_score"].astype(float).tolist(),
             "min_score": batch_df["min_score"].astype(float).tolist(),
             "max_score": batch_df["max_score"].astype(float).tolist(),
         }
 
 
 # =========================================================
-# LOSS FUNCTION
-# Runs a forward pass and computes MSE between predicted
-# normalized score and gold normalized score.
+# FUNCTIONAL FOMAML HELPERS
+# This is the key difference from your approximate version.
+# We do NOT deepcopy the model.
+# Instead we:
+# 1. get trainable parameter dict
+# 2. compute support gradients
+# 3. create fast weights
+# 4. evaluate query loss using fast weights
 # =========================================================
-def mse_loss_from_batch(model: nn.Module, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    preds = model(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
+
+def get_trainable_parameter_dict(model: nn.Module) -> "OrderedDict[str, torch.Tensor]":
+    return OrderedDict(
+        (name, param) for name, param in model.named_parameters() if param.requires_grad
     )
+
+
+def get_buffer_dict(model: nn.Module) -> "OrderedDict[str, torch.Tensor]":
+    return OrderedDict(model.named_buffers())
+
+
+def build_full_parameter_dict(
+    model: nn.Module,
+    fast_weights: "OrderedDict[str, torch.Tensor]",
+) -> "OrderedDict[str, torch.Tensor]":
+    """
+    Build a full parameter dictionary for functional_call:
+    - fast weights for trainable params
+    - original params for frozen params
+    """
+    full_params = OrderedDict()
+    for name, param in model.named_parameters():
+        if name in fast_weights:
+            full_params[name] = fast_weights[name]
+        else:
+            full_params[name] = param
+    return full_params
+
+
+def functional_forward(model, batch, fast_weights=None):
+    if fast_weights is None:
+        return model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+
+    full_params = build_full_parameter_dict(model, fast_weights)
+
+    return functional_call(
+        model,
+        full_params,
+        args=(batch["input_ids"], batch["attention_mask"]),
+    )
+
+
+def mse_loss_from_batch(
+    model: T5EncoderRegressor,
+    batch: Dict[str, torch.Tensor],
+    fast_weights: "OrderedDict[str, torch.Tensor]" = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    preds = functional_forward(model, batch, fast_weights=fast_weights)
     loss = F.mse_loss(preds, batch["scores"])
     return loss, preds
 
 
-# =========================================================
-# INNER ADAPTATION
-# This simulates the inner loop of meta-learning:
-# 1. clone the current model
-# 2. adapt it on support examples
-# 3. return adapted model
-#
-# IMPORTANT:
-# This is a FIRST VERSION / PRACTICAL APPROXIMATION.
-# It uses deepcopy(model) and an optimizer on the cloned model.
-#
-# This is NOT the final true FOMAML implementation.
-#
-# In the true FOMAML version, this should be replaced with:
-# - functional parameter updates
-# - no deepcopy(model)
-# - explicit fast weights
-# - meta-gradients computed from adapted parameters
-# =========================================================
-def inner_adapt_model(
+def inner_update_fomaml(
     model: T5EncoderRegressor,
     support_batch: Dict[str, torch.Tensor],
     inner_lr: float,
     inner_steps: int,
-    trainable_mode: str,
-    unfreeze_last_k: int,
-) -> T5EncoderRegressor:
+) -> "OrderedDict[str, torch.Tensor]":
     """
-    Practical first version of inner-loop adaptation.
+    True first-order style inner-loop update.
+
+    Start from current trainable parameters:
+        theta
+
+    Then for each inner step:
+        grads = grad(L_support(theta))
+        theta' = theta - alpha * grads
+
+    In FOMAML, we use create_graph=False.
     """
+    fast_weights = get_trainable_parameter_dict(model)
 
-    # -----------------------------------------------------
-    # FIRST-VERSION APPROXIMATION:
-    # Clone the model for task-specific adaptation.
-    # This is easy to understand and debug, but in the
-    # true FOMAML version this should be replaced with
-    # functional fast-weight updates instead of deepcopy.
-    # -----------------------------------------------------
-    adapted_model = deepcopy(model)
-    adapted_model.train()
-
-    # Re-apply trainable setting to the adapted model copy
-    set_trainable_params(adapted_model, trainable_mode, unfreeze_last_k)
-
-    # -----------------------------------------------------
-    # FIRST-VERSION APPROXIMATION:
-    # Use a standard optimizer on the copied model.
-    # In the true FOMAML script, this should become
-    # manual parameter updates:
-    #   theta' = theta - alpha * grad
-    # without building a separate copied optimizer.
-    # -----------------------------------------------------
-    inner_optimizer = torch.optim.SGD(
-        [p for p in adapted_model.parameters() if p.requires_grad],
-        lr=inner_lr,
-    )
-
-    # Perform one or more adaptation steps on the support set
     for _ in range(inner_steps):
-        inner_optimizer.zero_grad()
-        support_loss, _ = mse_loss_from_batch(adapted_model, support_batch)
-        support_loss.backward()
-        inner_optimizer.step()
+        support_loss, _ = mse_loss_from_batch(
+            model=model,
+            batch=support_batch,
+            fast_weights=fast_weights,
+        )
 
-    return adapted_model
+        grads = torch.autograd.grad(
+            support_loss,
+            list(fast_weights.values()),
+            create_graph=False,   # first-order MAML
+            retain_graph=False,
+            allow_unused=False,
+        )
+
+        fast_weights = OrderedDict(
+            (name, param - inner_lr * grad)
+            for (name, param), grad in zip(fast_weights.items(), grads)
+        )
+
+    return fast_weights
 
 
 # =========================================================
 # EPISODIC EVALUATION
-# For each validation/test episode:
-# 1. sample a task
-# 2. adapt on support
-# 3. evaluate on query
-#
-# This better reflects few-shot adaptation than plain
-# batch evaluation.
-#
-# IMPORTANT:
-# Since this uses the same deepcopy-based adaptation,
-# it is also part of the first practical version.
+# Adapt with fast weights on support, evaluate on query.
 # =========================================================
+
 @torch.no_grad()
+def simple_metrics_from_lists(preds: List[float], targets: List[float]) -> Dict[str, float]:
+    preds = np.array(preds, dtype=np.float32)
+    targets = np.array(targets, dtype=np.float32)
+
+    mse = float(np.mean((preds - targets) ** 2))
+    mae = float(np.mean(np.abs(preds - targets)))
+
+    return {
+        "mse_norm": mse,
+        "mae_norm": mae,
+    }
+
+
 def evaluate_episodic(
     model: T5EncoderRegressor,
     episodic_data: EpisodicAESDataset,
     num_episodes: int,
     inner_lr: float,
     inner_steps: int,
-    trainable_mode: str,
-    unfreeze_last_k: int,
 ) -> Dict[str, float]:
-    all_losses = []
-    all_preds_norm = []
-    all_targets_norm = []
+    model.eval()
 
-    # store raw-score predictions/targets by task = (essay_set, trait)
-    task_to_true = {}
-    task_to_pred = {}
+    losses = []
+    all_preds = []
+    all_targets = []
+    qwk_records = []
 
     for _ in range(num_episodes):
         task = random.choice(episodic_data.tasks)
         episode = episodic_data.sample_episode(task)
 
-        # support adaptation
+        support_batch = episode["support"]
+        query_batch = episode["query"]
+
         with torch.enable_grad():
-            adapted_model = inner_adapt_model(
+            fast_weights = inner_update_fomaml(
                 model=model,
-                support_batch=episode["support"],
+                support_batch=support_batch,
                 inner_lr=inner_lr,
                 inner_steps=inner_steps,
-                trainable_mode=trainable_mode,
-                unfreeze_last_k=unfreeze_last_k,
             )
 
-        adapted_model.eval()
-
-        # query evaluation
         with torch.no_grad():
-            query_loss, query_preds = mse_loss_from_batch(adapted_model, episode["query"])
+            query_loss, query_preds = mse_loss_from_batch(
+                model=model,
+                batch=query_batch,
+                fast_weights=fast_weights,
+            )
 
-        all_losses.append(query_loss.item())
+        losses.append(query_loss.item())
 
-        preds_norm = query_preds.squeeze(-1).cpu().numpy().tolist()
-        targets_norm = episode["query"]["scores"].squeeze(-1).cpu().numpy().tolist()
+        pred_list = query_preds.squeeze(-1).cpu().numpy().tolist()
+        true_list = query_batch["scores"].squeeze(-1).cpu().numpy().tolist()
 
-        all_preds_norm.extend(preds_norm)
-        all_targets_norm.extend(targets_norm)
+        all_preds.extend(pred_list)
+        all_targets.extend(true_list)
 
-        # collect metadata for denormalized QWK
-        essay_sets = episode["query"]["essay_set"]
-        traits = episode["query"]["trait"]
-        raw_scores = episode["query"]["raw_score"]
-        min_scores = episode["query"]["min_score"]
-        max_scores = episode["query"]["max_score"]
+        # collect metadata row-by-row for QWK
+        for i in range(len(pred_list)):
+            qwk_records.append(
+                {
+                    "essay_set": int(query_batch["essay_set"][i]),
+                    "trait": str(query_batch["trait"][i]),
+                    "min_score": float(query_batch["min_score"][i]),
+                    "max_score": float(query_batch["max_score"][i]),
+                    "true_norm": float(true_list[i]),
+                    "pred_norm": float(pred_list[i]),
+                }
+            )
 
-        for i in range(len(preds_norm)):
-            essay_set_i = int(essay_sets[i])
-            trait_i = str(traits[i])
-            raw_true = float(raw_scores[i])
-            min_s = float(min_scores[i])
-            max_s = float(max_scores[i])
+    all_preds = np.array(all_preds, dtype=np.float32)
+    all_targets = np.array(all_targets, dtype=np.float32)
 
-            raw_pred = denormalize_score(float(preds_norm[i]), min_s, max_s)
-            raw_pred_int = clamp_and_round_score(raw_pred, min_s, max_s)
-            raw_true_int = clamp_and_round_score(raw_true, min_s, max_s)
+    mse = float(np.mean((all_preds - all_targets) ** 2))
+    mae = float(np.mean(np.abs(all_preds - all_targets)))
 
-            task_key = (essay_set_i, trait_i)
-            task_to_true.setdefault(task_key, []).append(raw_true_int)
-            task_to_pred.setdefault(task_key, []).append(raw_pred_int)
+    qwk_results = compute_qwk_from_records(qwk_records)
 
-    all_preds_norm = np.array(all_preds_norm, dtype=np.float32)
-    all_targets_norm = np.array(all_targets_norm, dtype=np.float32)
-
-    mse = float(np.mean((all_preds_norm - all_targets_norm) ** 2))
-    mae = float(np.mean(np.abs(all_preds_norm - all_targets_norm)))
-
-    # per-task QWK
-    qwk_per_task = {}
-    qwk_values = []
-
-    for task_key in sorted(task_to_true.keys()):
-        y_true = task_to_true[task_key]
-        y_pred = task_to_pred[task_key]
-
-        if len(y_true) >= 2:
-            qwk = compute_qwk(y_true, y_pred)
-            qwk_per_task[f"{task_key[0]}::{task_key[1]}"] = qwk
-            if not np.isnan(qwk):
-                qwk_values.append(qwk)
-
-    mean_qwk = float(np.mean(qwk_values)) if len(qwk_values) > 0 else float("nan")
-
-    metrics = {
-        "loss": float(np.mean(all_losses)),
+    return {
+        "loss": float(np.mean(losses)),
         "mse_norm": mse,
         "mae_norm": mae,
-        "mean_qwk": mean_qwk,
+        "mean_qwk": qwk_results["mean_qwk"],
     }
-
-    # also include taskwise QWK in returned metrics
-    for k, v in qwk_per_task.items():
-        metrics[f"qwk_{k}"] = float(v)
-
-    return metrics
 
 
 # =========================================================
 # CHECKPOINT SAVING
-# Saves the current best meta-trained model, tokenizer, and
-# metadata describing the training setup.
 # =========================================================
+
 def save_checkpoint(model, tokenizer, save_dir, extra_info=None):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -835,19 +736,10 @@ def save_checkpoint(model, tokenizer, save_dir, extra_info=None):
 
 # =========================================================
 # MAIN
-# Full training pipeline:
-# 1. load raw ASAP-style data
-# 2. split by prompts
-# 3. convert wide -> long
-# 4. balance groups
-# 5. build episodic task pools
-# 6. meta-train
-# 7. validate periodically
-# 8. save best model
-# 9. test on held-out prompts
 # =========================================================
+
 def main():
-    print("Entering main function...")
+    print("Entering true FOMAML meta-training script...", flush=True)
 
     args = parse_args()
     setup_seed(args.seed)
@@ -855,57 +747,51 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Output directory: {args.output_dir}")
+    print(f"Device: {device}", flush=True)
+    print(f"Output directory: {args.output_dir}", flush=True)
 
     # -----------------------------------------------------
-    # Load raw data file
+    # Load data
     # -----------------------------------------------------
     df = load_table(args.train_file)
-
-    print(f"Loaded training data with {len(df)} rows.")
+    print(f"Loaded raw data with {len(df)} rows.", flush=True)
 
     required_cols = {"essay_id", "essay_set", "essay"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    # Detect which trait columns are actually present in the file
     available_traits = [t for t in TRAIT_COLUMNS if t in df.columns]
-    print("Available traits:", available_traits)
+    print("Available traits:", available_traits, flush=True)
 
-    # Infer score ranges if needed
     inferred_score_ranges = infer_score_ranges(df, available_traits)
 
     # -----------------------------------------------------
-    # Prompt-based split:
-    # train prompts for meta-training
-    # val prompt for episodic validation
-    # test prompt for held-out evaluation
+    # Prompt split
     # -----------------------------------------------------
     df_train_pool = df[df["essay_set"].isin(args.train_prompts)].copy()
     df_val_pool = df[df["essay_set"].isin(args.val_prompts)].copy()
     df_test_pool = df[df["essay_set"].isin(args.test_prompts)].copy()
 
-    print("\nPrompt-based split sizes:")
-    print("Train pool essays:", len(df_train_pool))
-    print("Val pool essays:", len(df_val_pool))
-    print("Test pool essays:", len(df_test_pool))
+    print("\nPrompt-based split sizes:", flush=True)
+    print("Train pool essays:", len(df_train_pool), flush=True)
+    print("Val pool essays:", len(df_val_pool), flush=True)
+    print("Test pool essays:", len(df_test_pool), flush=True)
 
     # -----------------------------------------------------
-    # Convert wide-format essay data into trait-wise long format
+    # Wide -> long
     # -----------------------------------------------------
     df_train_long = wide_to_long_with_norm(df_train_pool, available_traits, inferred_score_ranges)
     df_val_long = wide_to_long_with_norm(df_val_pool, available_traits, inferred_score_ranges)
     df_test_long = wide_to_long_with_norm(df_test_pool, available_traits, inferred_score_ranges)
 
-    print("\nTrait-wise sizes before balancing:")
-    print("Train long:", len(df_train_long))
-    print("Val long:", len(df_val_long))
-    print("Test long:", len(df_test_long))
+    print("\nTrait-wise sizes before balancing:", flush=True)
+    print("Train long:", len(df_train_long), flush=True)
+    print("Val long:", len(df_val_long), flush=True)
+    print("Test long:", len(df_test_long), flush=True)
 
     # -----------------------------------------------------
-    # Balance train and val groups
-    # This reduces dominance of large prompt/trait groups.
+    # Balance groups
     # -----------------------------------------------------
     df_train_meta = balanced_subset(
         df_train_long,
@@ -917,7 +803,7 @@ def main():
         max_per_group=args.max_samples_per_group_val,
         seed=args.seed,
     )
-    if args.max_samples_per_group_test > 0:
+    if args.max_samples_per_group_test is not None:
         df_test_meta = balanced_subset(
             df_test_long,
             max_per_group=args.max_samples_per_group_test,
@@ -926,32 +812,27 @@ def main():
     else:
         df_test_meta = df_test_long.reset_index(drop=True)
 
-    print("\nTrait-wise sizes after balancing:")
-    print("Train meta:", len(df_train_meta))
-    print("Val meta:", len(df_val_meta))
-    print("Test meta:", len(df_test_meta))
-
-    print("\nTrain group counts:")
-    print(df_train_meta.groupby(["essay_set", "trait"]).size().head(30))
-
-    print("\nVal group counts:")
-    print(df_val_meta.groupby(["essay_set", "trait"]).size().head(30))
+    print("\nTrait-wise sizes after balancing:", flush=True)
+    print("Train meta:", len(df_train_meta), flush=True)
+    print("Val meta:", len(df_val_meta), flush=True)
+    print("Test meta:", len(df_test_meta), flush=True)
 
     # -----------------------------------------------------
-    # Load tokenizer and aligned checkpoint
+    # Load tokenizer and model
     # -----------------------------------------------------
+    print("Loading tokenizer...", flush=True)
     tokenizer = T5Tokenizer.from_pretrained(args.model_path)
 
+    print("Loading model...", flush=True)
     model = T5EncoderRegressor(args.model_path)
     set_trainable_params(model, args.trainable_mode, args.unfreeze_last_k)
     model.to(device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    print(f"\nTrainable mode: {args.trainable_mode}")
-    print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
-    print(f"Total params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"\nTrainable mode: {args.trainable_mode}", flush=True)
+    print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}", flush=True)
+    print(f"Total params: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
-    # Outer-loop optimizer
     meta_optimizer = torch.optim.AdamW(
         trainable_params,
         lr=args.meta_lr,
@@ -959,8 +840,7 @@ def main():
     )
 
     # -----------------------------------------------------
-    # Build episodic datasets
-    # Each task = (essay_set, trait)
+    # Episodic datasets
     # -----------------------------------------------------
     train_episodic = EpisodicAESDataset(
         df_long=df_train_meta,
@@ -987,83 +867,69 @@ def main():
         device=device,
     )
 
-    print(f"\nTrain tasks: {len(train_episodic.tasks)}")
-    print(f"Val tasks: {len(val_episodic.tasks)}")
-    print(f"Test tasks: {len(test_episodic.tasks)}")
+    print(f"\nTrain tasks: {len(train_episodic.tasks)}", flush=True)
+    print(f"Val tasks: {len(val_episodic.tasks)}", flush=True)
+    print(f"Test tasks: {len(test_episodic.tasks)}", flush=True)
 
     # -----------------------------------------------------
-    # Meta-training state tracking
+    # Meta-training loop
     # -----------------------------------------------------
     best_val_mse = float("inf")
     best_step = -1
 
-    print("\nStarting meta-training...\n")
+    print("\nStarting true FOMAML meta-training...\n", flush=True)
 
-    # -----------------------------------------------------
-    # OUTER META-TRAINING LOOP
-    # Each step:
-    # 1. sample several tasks
-    # 2. adapt a copied model on each task's support set
-    # 3. compute query loss for each task
-    # 4. aggregate query losses into meta loss
-    # 5. update outer model
-    # -----------------------------------------------------
     for step in range(1, args.meta_steps + 1):
         model.train()
         meta_optimizer.zero_grad()
 
         meta_query_losses = []
 
-        # Sample a batch of tasks for this meta-step
         sampled_tasks = train_episodic.sample_task_batch(args.tasks_per_meta_batch)
 
-        # Process each sampled task separately
+        # -----------------------------------------------
+        # Inner + outer logic
+        # For each task:
+        # 1. sample support/query
+        # 2. compute fast weights from support
+        # 3. compute query loss with fast weights
+        # 4. accumulate query losses
+        # -----------------------------------------------
         for task in sampled_tasks:
             episode = train_episodic.sample_episode(task)
 
-            # -------------------------------------------------
-            # FIRST-VERSION APPROXIMATION:
-            # Task-specific adaptation via copied model.
-            # In the true FOMAML version, this should be
-            # replaced by fast-weight updates computed from
-            # support gradients directly.
-            # -------------------------------------------------
-            adapted_model = inner_adapt_model(
+            support_batch = episode["support"]
+            query_batch = episode["query"]
+
+            fast_weights = inner_update_fomaml(
                 model=model,
-                support_batch=episode["support"],
+                support_batch=support_batch,
                 inner_lr=args.inner_lr,
                 inner_steps=args.inner_steps,
-                trainable_mode=args.trainable_mode,
-                unfreeze_last_k=args.unfreeze_last_k,
             )
 
-            # Evaluate adapted model on query set
-            query_loss, _ = mse_loss_from_batch(adapted_model, episode["query"])
+            query_loss, _ = mse_loss_from_batch(
+                model=model,
+                batch=query_batch,
+                fast_weights=fast_weights,
+            )
+
             meta_query_losses.append(query_loss)
 
-        # Average query losses across tasks -> outer loss
+        # -----------------------------------------------
+        # Outer loss = mean query loss across tasks
+        # This is the true meta-objective in first-order
+        # form using task-adapted fast weights.
+        # -----------------------------------------------
         meta_loss = torch.stack(meta_query_losses).mean()
-
-        # -------------------------------------------------
-        # FIRST-VERSION APPROXIMATION:
-        # This outer backward is based on the adapted copied
-        # models and is not the clean functional FOMAML form.
-        #
-        # In the true FOMAML version, the query loss should
-        # backprop to the initial parameters through the
-        # first-order fast-weight update pipeline.
-        # -------------------------------------------------
         meta_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
         meta_optimizer.step()
 
         if step % args.print_every == 0:
-            print(f"[Step {step}/{args.meta_steps}] meta_loss={meta_loss.item():.6f}")
+            print(f"[Step {step}/{args.meta_steps}] meta_loss={meta_loss.item():.6f}", flush=True)
 
-        # -------------------------------------------------
-        # Periodic episodic validation
-        # -------------------------------------------------
         if step % args.val_every == 0:
             val_metrics = evaluate_episodic(
                 model=model,
@@ -1071,8 +937,6 @@ def main():
                 num_episodes=args.val_episodes,
                 inner_lr=args.inner_lr,
                 inner_steps=args.inner_steps,
-                trainable_mode=args.trainable_mode,
-                unfreeze_last_k=args.unfreeze_last_k,
             )
 
             print(
@@ -1080,10 +944,10 @@ def main():
                 f"loss={val_metrics['loss']:.6f} | "
                 f"mse_norm={val_metrics['mse_norm']:.6f} | "
                 f"mae_norm={val_metrics['mae_norm']:.6f} | "
-                f"mean_qwk={val_metrics['mean_qwk']:.6f}"
+                f"mean_qwk={val_metrics['mean_qwk']:.6f}",
+                flush=True,
             )
 
-            # Save best model based on validation MSE
             if val_metrics["mse_norm"] < best_val_mse:
                 best_val_mse = val_metrics["mse_norm"]
                 best_step = step
@@ -1103,33 +967,28 @@ def main():
                         "inner_steps": args.inner_steps,
                         "inner_lr": args.inner_lr,
                         "meta_lr": args.meta_lr,
-                        "note": "This checkpoint comes from the first practical episodic version, not yet the true functional FOMAML implementation.",
+                        "note": "True first-order MAML style version with fast weights, no deepcopy-based inner loop.",
                     },
                 )
-                print(f"[Best saved] step={best_step}, val_mse_norm={best_val_mse:.6f}")
+                print(f"[Best saved] step={best_step}, val_mse_norm={best_val_mse:.6f}", flush=True)
 
-    print("\nMeta-training complete.")
-    print(f"Best val mse_norm: {best_val_mse:.6f} at step {best_step}")
+    print("\nMeta-training complete.", flush=True)
+    print(f"Best val mse_norm: {best_val_mse:.6f} at step {best_step}", flush=True)
 
     # -----------------------------------------------------
-    # Reload best checkpoint before final test
+    # Final test
     # -----------------------------------------------------
     best_ckpt_path = os.path.join(args.output_dir, "best_meta_model", "meta_model.pt")
     if os.path.exists(best_ckpt_path):
         model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
         model.to(device)
 
-    # -----------------------------------------------------
-    # Final episodic test on held-out prompt tasks
-    # -----------------------------------------------------
     test_metrics = evaluate_episodic(
         model=model,
         episodic_data=test_episodic,
         num_episodes=args.test_episodes,
         inner_lr=args.inner_lr,
         inner_steps=args.inner_steps,
-        trainable_mode=args.trainable_mode,
-        unfreeze_last_k=args.unfreeze_last_k,
     )
 
     print(
@@ -1137,7 +996,8 @@ def main():
         f"loss={test_metrics['loss']:.6f} | "
         f"mse_norm={test_metrics['mse_norm']:.6f} | "
         f"mae_norm={test_metrics['mae_norm']:.6f} | "
-        f"mean_qwk={test_metrics['mean_qwk']:.6f}"
+        f"mean_qwk={test_metrics['mean_qwk']:.6f}",
+        flush=True,
     )
 
     with open(os.path.join(args.output_dir, "final_test_metrics.json"), "w") as f:

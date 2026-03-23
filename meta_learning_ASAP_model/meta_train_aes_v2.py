@@ -157,13 +157,13 @@ def parse_args():
 
     # Prompt split used to simulate cross-prompt transfer
     parser.add_argument("--train_prompts", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6])
-    parser.add_argument("--val_prompts", type=int, nargs="+", default=[7])
-    parser.add_argument("--test_prompts", type=int, nargs="+", default=[8])
+    parser.add_argument("--val_prompts", type=int, nargs="+", default=[8])
+    parser.add_argument("--test_prompts", type=int, nargs="+", default=[7])
 
     # Optional balancing to avoid some prompt/trait groups dominating training
-    parser.add_argument("--max_samples_per_group_train", type=int, default=1000)
-    parser.add_argument("--max_samples_per_group_val", type=int, default=500)
-    parser.add_argument("--max_samples_per_group_test", type=int, default=500)
+    parser.add_argument("--max_samples_per_group_train", type=int, default=500)
+    parser.add_argument("--max_samples_per_group_val", type=int, default=200)
+    parser.add_argument("--max_samples_per_group_test", type=int, default=200)
 
     # Meta-learning episode settings
     parser.add_argument("--support_size", type=int, default=8)
@@ -187,6 +187,12 @@ def parse_args():
     parser.add_argument("--val_episodes", type=int, default=100)
     parser.add_argument("--test_episodes", type=int, default=200)
     parser.add_argument("--print_every", type=int, default=20)
+
+    # QWK debugging
+    parser.add_argument("--log_qwk_details", action="store_true",
+                        help="Print per-task QWK debug info during validation/test.")
+    parser.add_argument("--qwk_log_top_k", type=int, default=20,
+                        help="How many task-level QWK debug lines to print.")
 
     return parser.parse_args()
 
@@ -231,24 +237,103 @@ def denormalize_score(score_norm: float, min_score: float, max_score: float) -> 
     return score_norm * (max_score - min_score) + min_score
 
 
-def clamp_and_round_score(score_raw: float, min_score: float, max_score: float) -> int:
-    return int(np.clip(np.round(score_raw), min_score, max_score))
-
-
-def compute_qwk(y_true: List[int], y_pred: List[int]) -> float:
+def restore_valid_score(score_norm: float, min_score: float, max_score: float) -> int:
     """
-    Quadratic Weighted Kappa for integer labels.
+    Convert a normalized score into a valid raw integer score by:
+    1. denormalizing back to raw space
+    2. clamping to the valid trait range
+    3. rounding to the nearest integer
+
+    This mirrors the logic used in the true FOMAML script so QWK
+    is computed consistently across both implementations.
     """
-    if len(y_true) == 0:
-        return float("nan")
+    raw_score = denormalize_score(score_norm, min_score, max_score)
+    raw_score = max(min_score, min(max_score, raw_score))
+    return int(round(raw_score))
 
-    # If all labels collapse to one value in a tiny episode, sklearn can behave oddly.
-    # This keeps it safe.
-    unique_labels = sorted(set(y_true) | set(y_pred))
-    if len(unique_labels) <= 1:
-        return 1.0
 
-    return float(cohen_kappa_score(y_true, y_pred, labels=unique_labels, weights="quadratic"))
+def compute_qwk_from_records(records: List[Dict]) -> Dict[str, object]:
+    """
+    Compute QWK separately for each (essay_set, trait) group using the
+    same denormalize -> clamp -> round path as the FOMAML script.
+
+    Returns mean QWK, per-task QWKs, and task-level debug info so we can
+    inspect whether predictions have collapsed to one or two score bins.
+    """
+    if len(records) == 0:
+        return {
+            "mean_qwk": 0.0,
+            "group_qwks": {},
+            "group_debug": {},
+        }
+
+    df_tmp = pd.DataFrame(records)
+
+    group_qwks = {}
+    group_debug = {}
+    qwk_values = []
+
+    for (essay_set, trait), group_df in df_tmp.groupby(["essay_set", "trait"]):
+        min_score = float(group_df["min_score"].iloc[0])
+        max_score = float(group_df["max_score"].iloc[0])
+
+        y_true = [
+            restore_valid_score(v, min_score, max_score)
+            for v in group_df["true_norm"].astype(float).tolist()
+        ]
+        y_pred = [
+            restore_valid_score(v, min_score, max_score)
+            for v in group_df["pred_norm"].astype(float).tolist()
+        ]
+
+        qwk = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+        if pd.isna(qwk):
+            qwk = 0.0
+
+        key = f"prompt_{essay_set}_{trait}"
+        group_qwks[key] = float(qwk)
+        qwk_values.append(float(qwk))
+
+        pred_counts = pd.Series(y_pred).value_counts().sort_index().to_dict()
+        true_counts = pd.Series(y_true).value_counts().sort_index().to_dict()
+        group_debug[key] = {
+            "n": int(len(group_df)),
+            "min_score": min_score,
+            "max_score": max_score,
+            "qwk": float(qwk),
+            "unique_true": sorted(set(y_true)),
+            "unique_pred": sorted(set(y_pred)),
+            "true_counts": {str(k): int(v) for k, v in true_counts.items()},
+            "pred_counts": {str(k): int(v) for k, v in pred_counts.items()},
+            "pred_norm_mean": float(group_df["pred_norm"].astype(float).mean()),
+            "pred_norm_std": float(group_df["pred_norm"].astype(float).std(ddof=0)),
+            "true_norm_mean": float(group_df["true_norm"].astype(float).mean()),
+        }
+
+    mean_qwk = float(np.mean(qwk_values)) if len(qwk_values) > 0 else 0.0
+
+    return {
+        "mean_qwk": mean_qwk,
+        "group_qwks": group_qwks,
+        "group_debug": group_debug,
+    }
+
+
+def print_qwk_debug(group_debug: Dict[str, Dict[str, object]], top_k: int = 20):
+    if not group_debug:
+        print("[QWK debug] no group-level records available")
+        return
+
+    print("[QWK debug] task-level summary (sorted by qwk ascending):")
+    items = sorted(group_debug.items(), key=lambda kv: (kv[1]["qwk"], kv[0]))
+    for task_key, info in items[:top_k]:
+        print(
+            f"  - {task_key}: qwk={info['qwk']:.6f} | n={info['n']} | "
+            f"range=[{info['min_score']:.0f},{info['max_score']:.0f}] | "
+            f"unique_true={info['unique_true']} | unique_pred={info['unique_pred']} | "
+            f"pred_norm_mean={info['pred_norm_mean']:.4f} | pred_norm_std={info['pred_norm_std']:.4f} | "
+            f"pred_counts={info['pred_counts']}"
+        )
 
 
 # =========================================================
@@ -721,20 +806,18 @@ def evaluate_episodic(
     inner_steps: int,
     trainable_mode: str,
     unfreeze_last_k: int,
+    log_qwk_details: bool = False,
+    qwk_log_top_k: int = 20,
 ) -> Dict[str, float]:
     all_losses = []
     all_preds_norm = []
     all_targets_norm = []
-
-    # store raw-score predictions/targets by task = (essay_set, trait)
-    task_to_true = {}
-    task_to_pred = {}
+    qwk_records = []
 
     for _ in range(num_episodes):
         task = random.choice(episodic_data.tasks)
         episode = episodic_data.sample_episode(task)
 
-        # support adaptation
         with torch.enable_grad():
             adapted_model = inner_adapt_model(
                 model=model,
@@ -747,7 +830,6 @@ def evaluate_episodic(
 
         adapted_model.eval()
 
-        # query evaluation
         with torch.no_grad():
             query_loss, query_preds = mse_loss_from_batch(adapted_model, episode["query"])
 
@@ -759,27 +841,22 @@ def evaluate_episodic(
         all_preds_norm.extend(preds_norm)
         all_targets_norm.extend(targets_norm)
 
-        # collect metadata for denormalized QWK
         essay_sets = episode["query"]["essay_set"]
         traits = episode["query"]["trait"]
-        raw_scores = episode["query"]["raw_score"]
         min_scores = episode["query"]["min_score"]
         max_scores = episode["query"]["max_score"]
 
         for i in range(len(preds_norm)):
-            essay_set_i = int(essay_sets[i])
-            trait_i = str(traits[i])
-            raw_true = float(raw_scores[i])
-            min_s = float(min_scores[i])
-            max_s = float(max_scores[i])
-
-            raw_pred = denormalize_score(float(preds_norm[i]), min_s, max_s)
-            raw_pred_int = clamp_and_round_score(raw_pred, min_s, max_s)
-            raw_true_int = clamp_and_round_score(raw_true, min_s, max_s)
-
-            task_key = (essay_set_i, trait_i)
-            task_to_true.setdefault(task_key, []).append(raw_true_int)
-            task_to_pred.setdefault(task_key, []).append(raw_pred_int)
+            qwk_records.append(
+                {
+                    "essay_set": int(essay_sets[i]),
+                    "trait": str(traits[i]),
+                    "min_score": float(min_scores[i]),
+                    "max_score": float(max_scores[i]),
+                    "true_norm": float(targets_norm[i]),
+                    "pred_norm": float(preds_norm[i]),
+                }
+            )
 
     all_preds_norm = np.array(all_preds_norm, dtype=np.float32)
     all_targets_norm = np.array(all_targets_norm, dtype=np.float32)
@@ -787,34 +864,26 @@ def evaluate_episodic(
     mse = float(np.mean((all_preds_norm - all_targets_norm) ** 2))
     mae = float(np.mean(np.abs(all_preds_norm - all_targets_norm)))
 
-    # per-task QWK
-    qwk_per_task = {}
-    qwk_values = []
-
-    for task_key in sorted(task_to_true.keys()):
-        y_true = task_to_true[task_key]
-        y_pred = task_to_pred[task_key]
-
-        if len(y_true) >= 2:
-            qwk = compute_qwk(y_true, y_pred)
-            qwk_per_task[f"{task_key[0]}::{task_key[1]}"] = qwk
-            if not np.isnan(qwk):
-                qwk_values.append(qwk)
-
-    mean_qwk = float(np.mean(qwk_values)) if len(qwk_values) > 0 else float("nan")
+    qwk_results = compute_qwk_from_records(qwk_records)
 
     metrics = {
         "loss": float(np.mean(all_losses)),
         "mse_norm": mse,
         "mae_norm": mae,
-        "mean_qwk": mean_qwk,
+        "mean_qwk": qwk_results["mean_qwk"],
+        "qwk_group_count": int(len(qwk_results["group_qwks"])),
     }
 
-    # also include taskwise QWK in returned metrics
-    for k, v in qwk_per_task.items():
-        metrics[f"qwk_{k}"] = float(v)
+    for task_key, qwk in qwk_results["group_qwks"].items():
+        metrics[f"qwk_{task_key}"] = float(qwk)
+
+    metrics["qwk_debug"] = qwk_results["group_debug"]
+
+    if log_qwk_details:
+        print_qwk_debug(qwk_results["group_debug"], top_k=qwk_log_top_k)
 
     return metrics
+
 
 
 # =========================================================
@@ -1073,6 +1142,8 @@ def main():
                 inner_steps=args.inner_steps,
                 trainable_mode=args.trainable_mode,
                 unfreeze_last_k=args.unfreeze_last_k,
+                log_qwk_details=args.log_qwk_details,
+                qwk_log_top_k=args.qwk_log_top_k,
             )
 
             print(
@@ -1080,7 +1151,8 @@ def main():
                 f"loss={val_metrics['loss']:.6f} | "
                 f"mse_norm={val_metrics['mse_norm']:.6f} | "
                 f"mae_norm={val_metrics['mae_norm']:.6f} | "
-                f"mean_qwk={val_metrics['mean_qwk']:.6f}"
+                f"mean_qwk={val_metrics['mean_qwk']:.6f} | "
+                f"qwk_groups={val_metrics['qwk_group_count']}"
             )
 
             # Save best model based on validation MSE
@@ -1130,6 +1202,8 @@ def main():
         inner_steps=args.inner_steps,
         trainable_mode=args.trainable_mode,
         unfreeze_last_k=args.unfreeze_last_k,
+        log_qwk_details=args.log_qwk_details,
+        qwk_log_top_k=args.qwk_log_top_k,
     )
 
     print(
@@ -1137,7 +1211,8 @@ def main():
         f"loss={test_metrics['loss']:.6f} | "
         f"mse_norm={test_metrics['mse_norm']:.6f} | "
         f"mae_norm={test_metrics['mae_norm']:.6f} | "
-        f"mean_qwk={test_metrics['mean_qwk']:.6f}"
+        f"mean_qwk={test_metrics['mean_qwk']:.6f} | "
+        f"qwk_groups={test_metrics['qwk_group_count']}"
     )
 
     with open(os.path.join(args.output_dir, "final_test_metrics.json"), "w") as f:
