@@ -97,11 +97,11 @@ SCORE_RANGES: Dict[Tuple[int, str], Tuple[float, float]] = {
     (4, "narrativity"): (0, 3),
 
     (5, "content"): (0, 4),
-    (5, "prompt_adherence"): (0, 8),
-    (5, "language"): (0, 8),
-    (5, "narrativity"): (0, 8),
+    (5, "prompt_adherence"): (0, 4),
+    (5, "language"): (0, 4),
+    (5, "narrativity"): (0, 4),
 
-    (6, "content"): (0, 8),
+    (6, "content"): (0, 4),
     (6, "prompt_adherence"): (0, 4),
     (6, "language"): (0, 4),
     (6, "narrativity"): (0, 4),

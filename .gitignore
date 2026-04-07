@@ -34,4 +34,9 @@ outputs_sanity/
 results_finetune_baseline/
 results_meta_aes/
 results_small_lora_asaptraits/
-
+results_meta_maml_pure/
+results_lora_meta_adapt/
+results_meta_anil_lora/
+results_meta_anil_pure/
+results_meta_fomaml_run4/
+results_meta_maml_roberta/
