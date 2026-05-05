@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=HEAD_ONLY_ADAPTOR
-#SBATCH -o head_only_adaptor.out
-#SBATCH -e head_only_adaptor.err
-#SBATCH --partition=gpu
+#SBATCH --job-name=HEAD_ONLY_DEBERTA_ORD
+#SBATCH -o head_only_deberta_ordinal.out
+#SBATCH -e head_only_deberta_ordinal.err
+#SBATCH --partition=bigmem
 #SBATCH --gres=gpu:1
 #SBATCH --mem=60G
 #SBATCH --time=08:00:00
@@ -20,14 +20,18 @@ module load Python/3.9.6
 source mytest/bin/activate
 export PYTHONUNBUFFERED=1
 
-python3 head_only_adaptor/head_only_adaptor.py \
+python3 deberta/adaptor.py \
   --data_path ../data/asap_train_with_all_traits.tsv \
   --split_root target_splits \
-  --base_root outputs \
-  --output_root head_only_adaptor \
+  --base_root outputs_deberta_ordinal \
+  --output_root head_only_deberta_ordinal \
   --heldout_prompts 2 \
-  --fewshot_sizes 8,16,32,64,128 \
-  --loss_type mse \
+  --fewshot_sizes 32,64,128 \
+  --encoder_name microsoft/deberta-v3-base \
+  --head_type ordinal \
+  --num_bins 6 \
+  --pooling cls \
+  --max_length 512 \
   --num_epochs 30 \
   --lr 1e-3 \
   --batch_size 4 \

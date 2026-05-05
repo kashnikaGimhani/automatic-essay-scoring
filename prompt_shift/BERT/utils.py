@@ -13,7 +13,7 @@ from sklearn.metrics import cohen_kappa_score, mean_squared_error
 from transformers import AutoModel
 
 
-MODEL_NAME = "roberta-base"
+MODEL_NAME = "bert-base-uncased"
 
 TRAIT_COLUMNS = [
     "content",
@@ -295,26 +295,6 @@ class AESDataset(Dataset):
             item["token_type_ids"] = self.token_type_ids[idx]
         return item
 
-class AESIndexedDataset(Dataset):
-    """Lightweight view over an AESDataset for episodic support/query splits."""
-
-    def __init__(self, base_dataset: AESDataset, indices: List[int]):
-        self.base_dataset = base_dataset
-        self.indices = list(indices)
-        self.prompt_ids = [base_dataset.prompt_ids[i] for i in self.indices]
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        base_idx = self.indices[idx]
-        return {
-            "input_ids": self.base_dataset.input_ids[base_idx],
-            "attention_mask": self.base_dataset.attention_mask[base_idx],
-            "labels": torch.tensor(self.base_dataset.labels_norm[base_idx], dtype=torch.float32),
-            "label_mask": torch.tensor(self.base_dataset.label_mask[base_idx], dtype=torch.float32),
-            "idx": torch.tensor(idx, dtype=torch.long),
-        }
 
 def masked_mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).float()
@@ -340,11 +320,20 @@ class MultiTraitAESModel(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
-        outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        pooled = masked_mean_pool(outputs.last_hidden_state, attention_mask)
+        encoder_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if token_type_ids is not None:
+            encoder_kwargs["token_type_ids"] = token_type_ids
+
+        outputs = self.encoder(**encoder_kwargs)
+
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            pooled = outputs.pooler_output
+        else:
+            pooled = outputs.last_hidden_state[:, 0]
+
         preds = self.regressor(pooled)
         return preds
 
@@ -635,24 +624,3 @@ def amp_context(device: torch.device):
     autocast_dtype = torch.float16 if amp_enabled else torch.bfloat16
     return amp_enabled, autocast_device, autocast_dtype
 
-def snapshot_trainable_state(model: nn.Module) -> Dict[str, torch.Tensor]:
-    return {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
-
-
-def restore_trainable_state(model: nn.Module, state: Dict[str, torch.Tensor]):
-    name_to_param = dict(model.named_parameters())
-    for name, tensor in state.items():
-        if name in name_to_param:
-            name_to_param[name].data.copy_(tensor.to(name_to_param[name].device))
-
-
-def reptile_meta_update_(model: nn.Module, start_state: Dict[str, torch.Tensor], step_size: float):
-    name_to_param = dict(model.named_parameters())
-    for name, start_tensor in start_state.items():
-        param = name_to_param[name]
-        start_tensor = start_tensor.to(param.device)
-        param.data.copy_(start_tensor + step_size * (param.data - start_tensor))
-
-def mark_all_trainable(model: nn.Module):
-    for p in model.parameters():
-        p.requires_grad = True

@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=HEAD_ONLY_ADAPTOR
-#SBATCH -o head_only_adaptor.out
-#SBATCH -e head_only_adaptor.err
-#SBATCH --partition=gpu
+#SBATCH --job-name=BASE_BERT   
+#SBATCH -o base_bert.out
+#SBATCH -e base_bert.err
+#SBATCH --partition=bigmem
 #SBATCH --gres=gpu:1
 #SBATCH --mem=60G
 #SBATCH --time=08:00:00
@@ -20,16 +20,15 @@ module load Python/3.9.6
 source mytest/bin/activate
 export PYTHONUNBUFFERED=1
 
-python3 head_only_adaptor/head_only_adaptor.py \
+python3 BERT/base.py \
   --data_path ../data/asap_train_with_all_traits.tsv \
-  --split_root target_splits \
-  --base_root outputs \
-  --output_root head_only_adaptor \
-  --heldout_prompts 2 \
-  --fewshot_sizes 8,16,32,64,128 \
-  --loss_type mse \
-  --num_epochs 30 \
-  --lr 1e-3 \
+  --output_dir outputs/base_prompt2 \
+  --heldout_prompt 2 \
+  --sep $'\t' \
+  --num_epochs 10 \
   --batch_size 4 \
   --eval_batch_size 8 \
-  --sep $'\t'
+  --max_length 480 \
+  --dev_ratio 0.1 \
+  --save_split_files \
+  --run_zero_shot_eval

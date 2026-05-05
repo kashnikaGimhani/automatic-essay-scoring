@@ -177,10 +177,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python3 create_target_fewshot_splits.py \
-#   --data_path your_data.tsv \
-#   --output_dir experiments/target_splits \
-#   --heldout_prompts all \
+# python3 create_fewshot_splits.py \
+#   --data_path ../data/asap_train_with_all_traits.tsv \
+#   --output_dir target_splits \
+#   --heldout_prompts 2,4,6 \
 #   --fewshot_sizes 8,16,32,64,128 \
 #   --num_repeats 5 \
 #   --dev_ratio 0.2 \

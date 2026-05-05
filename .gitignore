@@ -6,6 +6,8 @@ __pycache__/
 
 # Data (DO NOT COMMIT)
 data/
+target_splits/
+target_splits_v2/
 *.tsv
 *.csv
 
@@ -40,3 +42,5 @@ results_meta_anil_lora/
 results_meta_anil_pure/
 results_meta_fomaml_run4/
 results_meta_maml_roberta/
+plots/
+qwk_lots/

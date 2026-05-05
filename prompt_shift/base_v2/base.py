@@ -9,6 +9,13 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
+import sys
+from pathlib import Path
+
+PARENT_DIR = str(Path(__file__).resolve().parents[1])
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
+
 from utils import (
     MODEL_NAME,
     TRAIT_COLUMNS,
@@ -31,6 +38,13 @@ from utils import (
 print("Libraries imported successfully.", flush=True)
 
 
+def parse_prompt_csv(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    return [normalize_prompt_id(x) for x in raw.split(",") if x.strip()]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Base training for prompt-shift AES")
 
@@ -39,6 +53,7 @@ def parse_args():
     parser.add_argument("--sep", type=str, default="\t", help="File separator, default is tab")
 
     parser.add_argument("--heldout_prompt", type=str, required=True, help="Prompt ID to hold out")
+    parser.add_argument("--source_prompts", type=str, default="", help="Comma-separated source prompts to use for training/dev. Default: all prompts except held-out")
     parser.add_argument("--prompt_col", type=str, default="essay_set")
     parser.add_argument("--text_col", type=str, default="essay")
     parser.add_argument("--id_col", type=str, default="essay_id")
@@ -107,6 +122,7 @@ def save_checkpoint(
         {
             "model_name": MODEL_NAME,
             "heldout_prompt": args.heldout_prompt,
+            "source_prompts": parse_prompt_csv(args.source_prompts),
             "trait_cols": trait_cols,
             "prompt_col": args.prompt_col,
             "text_col": args.text_col,
@@ -149,8 +165,34 @@ def main():
     if heldout_prompt not in all_prompts:
         raise ValueError(f"Held-out prompt {heldout_prompt} not found in dataset. Found: {all_prompts}")
 
-    source_df = df[df[args.prompt_col] != heldout_prompt].copy().reset_index(drop=True)
+    candidate_source_df = df[df[args.prompt_col] != heldout_prompt].copy().reset_index(drop=True)
     target_df = df[df[args.prompt_col] == heldout_prompt].copy().reset_index(drop=True)
+
+    selected_source_prompts = parse_prompt_csv(args.source_prompts)
+    if selected_source_prompts:
+        invalid_source_prompts = sorted(set(selected_source_prompts) - set(all_prompts))
+        if invalid_source_prompts:
+            raise ValueError(
+                f"Requested source prompts not found in dataset: {invalid_source_prompts}. Found: {all_prompts}"
+            )
+        if heldout_prompt in selected_source_prompts:
+            raise ValueError(
+                f"Held-out prompt {heldout_prompt} cannot also be included in --source_prompts: {selected_source_prompts}"
+            )
+        source_df = candidate_source_df[
+            candidate_source_df[args.prompt_col].astype(str).isin(selected_source_prompts)
+        ].copy().reset_index(drop=True)
+    else:
+        source_df = candidate_source_df
+
+    selected_source_prompts = sorted(source_df[args.prompt_col].astype(str).unique().tolist())
+
+    if len(source_df) == 0:
+        raise ValueError(
+            "No source data left for training after applying --heldout_prompt and --source_prompts."
+        )
+    if len(selected_source_prompts) == 0:
+        raise ValueError("No source prompts selected for training.")
 
     train_df, dev_df = split_source_by_prompt(
         df_source=source_df,
@@ -159,11 +201,12 @@ def main():
         seed=args.seed,
     )
 
-    print(f"All prompts      : {all_prompts}")
-    print(f"Held-out prompt  : {heldout_prompt}")
-    print(f"Source train size: {len(train_df)}")
-    print(f"Source dev size  : {len(dev_df)}")
-    print(f"Held-out size    : {len(target_df)}")
+    print(f"All prompts           : {all_prompts}")
+    print(f"Held-out prompt       : {heldout_prompt}")
+    print(f"Selected source prompts: {selected_source_prompts}")
+    print(f"Source train size     : {len(train_df)}")
+    print(f"Source dev size       : {len(dev_df)}")
+    print(f"Held-out size         : {len(target_df)}")
 
     prompt_text_map = build_prompt_text_map()
     score_ranges = build_score_ranges_from_hardcoded()
@@ -175,6 +218,17 @@ def main():
         train_df.to_csv(os.path.join(split_dir, "source_train.tsv"), sep="\t", index=False)
         dev_df.to_csv(os.path.join(split_dir, "source_dev.tsv"), sep="\t", index=False)
         target_df.to_csv(os.path.join(split_dir, f"heldout_prompt_{heldout_prompt}.tsv"), sep="\t", index=False)
+        save_json(
+            {
+                "all_prompts": all_prompts,
+                "heldout_prompt": heldout_prompt,
+                "selected_source_prompts": selected_source_prompts,
+                "source_train_n": len(train_df),
+                "source_dev_n": len(dev_df),
+                "heldout_n": len(target_df),
+            },
+            os.path.join(split_dir, "split_metadata.json"),
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 

@@ -2,6 +2,7 @@ import os
 import json
 import math
 import random
+from collections import OrderedDict
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -11,6 +12,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from sklearn.metrics import cohen_kappa_score, mean_squared_error
 from transformers import AutoModel
+
+try:
+    from torch.func import functional_call
+except Exception:
+    from torch.nn.utils.stateless import functional_call
 
 
 MODEL_NAME = "roberta-base"
@@ -295,6 +301,7 @@ class AESDataset(Dataset):
             item["token_type_ids"] = self.token_type_ids[idx]
         return item
 
+
 class AESIndexedDataset(Dataset):
     """Lightweight view over an AESDataset for episodic support/query splits."""
 
@@ -316,6 +323,7 @@ class AESIndexedDataset(Dataset):
             "idx": torch.tensor(idx, dtype=torch.long),
         }
 
+
 def masked_mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).float()
     masked = last_hidden_state * mask
@@ -324,20 +332,35 @@ def masked_mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tens
     return summed / counts
 
 
+class TraitHead(nn.Module):
+    def __init__(self, hidden_size: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        self.hidden = nn.Linear(hidden_size, hidden_size)
+        self.act = nn.GELU()
+        self.dropout2 = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden_size, 1)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        x = self.norm(pooled)
+        x = self.dropout1(x)
+        x = self.hidden(x)
+        x = self.act(x)
+        x = self.dropout2(x)
+        return self.out(x)
+
+
 class MultiTraitAESModel(nn.Module):
-    def __init__(self, dropout: float, num_traits: int):
+    def __init__(self, dropout: float, trait_names: List[str]):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(MODEL_NAME)
         hidden = self.encoder.config.hidden_size
-
-        self.regressor = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, num_traits),
-        )
+        self.trait_names = list(trait_names)
+        self.head_type = "separate_trait_heads"
+        self.trait_heads = nn.ModuleDict({
+            trait: TraitHead(hidden, dropout) for trait in self.trait_names
+        })
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         outputs = self.encoder(
@@ -345,16 +368,19 @@ class MultiTraitAESModel(nn.Module):
             attention_mask=attention_mask,
         )
         pooled = masked_mean_pool(outputs.last_hidden_state, attention_mask)
-        preds = self.regressor(pooled)
-        return preds
+        preds = [self.trait_heads[trait](pooled) for trait in self.trait_names]
+        return torch.cat(preds, dim=-1)
+
 
 def freeze_encoder_only(model: nn.Module):
     for p in model.encoder.parameters():
         p.requires_grad = False
-    for p in model.regressor.parameters():
+    for p in model.trait_heads.parameters():
         p.requires_grad = True
 
+
 def masked_regression_loss(
+
     preds: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
@@ -391,10 +417,32 @@ def quadratic_weighted_kappa_safe(y_true: np.ndarray, y_pred: np.ndarray) -> flo
         return float("nan")
 
 
+def functional_forward(
+    model: nn.Module,
+    params_override: Optional[OrderedDict],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    token_type_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if params_override is None:
+        return model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+
+    return functional_call(
+        model,
+        params_override,
+        (),
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        },
+    )
+
+
 def evaluate(
     model: nn.Module,
     dataloader,
-    dataset: AESDataset,
+    dataset,
     trait_cols: List[str],
     score_ranges: Dict[str, Dict[str, Dict[str, float]]],
     global_trait_fallback: Dict[str, Dict[str, float]],
@@ -402,6 +450,7 @@ def evaluate(
     round_step: float,
     loss_type: str,
     huber_delta: float,
+    params_override: Optional[OrderedDict] = None,
 ) -> Dict[str, Any]:
     model.eval()
 
@@ -423,7 +472,9 @@ def evaluate(
 
             token_type_ids = batch["token_type_ids"].to(device) if "token_type_ids" in batch else None
 
-            preds = model(
+            preds = functional_forward(
+                model=model,
+                params_override=params_override,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -544,28 +595,70 @@ def format_metrics_for_print(name: str, metrics: Dict[str, Any]) -> str:
         )
     return "\n".join(lines)
 
+
 def parse_prompt_list(raw: str, all_prompts: List[str]) -> List[str]:
     raw = raw.strip().lower()
     if raw == "all":
         return sorted(all_prompts)
     return [normalize_prompt_id(x) for x in raw.split(",") if x.strip()]
 
+
 def parse_int_list(raw: str) -> List[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def _init_separate_trait_heads_from_shared_regressor(model: nn.Module, ckpt_state: Dict[str, torch.Tensor], trait_cols: List[str]):
+    shared_keys = [
+        "regressor.0.weight",
+        "regressor.0.bias",
+        "regressor.2.weight",
+        "regressor.2.bias",
+        "regressor.5.weight",
+        "regressor.5.bias",
+    ]
+    if not all(k in ckpt_state for k in shared_keys):
+        return
+
+    ln_w = ckpt_state["regressor.0.weight"]
+    ln_b = ckpt_state["regressor.0.bias"]
+    hidden_w = ckpt_state["regressor.2.weight"]
+    hidden_b = ckpt_state["regressor.2.bias"]
+    out_w = ckpt_state["regressor.5.weight"]
+    out_b = ckpt_state["regressor.5.bias"]
+
+    with torch.no_grad():
+        for idx, trait in enumerate(trait_cols):
+            head = model.trait_heads[trait]
+            head.norm.weight.copy_(ln_w)
+            head.norm.bias.copy_(ln_b)
+            head.hidden.weight.copy_(hidden_w)
+            head.hidden.bias.copy_(hidden_b)
+            head.out.weight.copy_(out_w[idx:idx + 1])
+            head.out.bias.copy_(out_b[idx:idx + 1])
+
 
 def load_base_checkpoint_into_model(base_ckpt_dir: str, device: torch.device, dropout_override: float = -1.0):
     ckpt_path = os.path.join(base_ckpt_dir, "best_model.pt")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Base checkpoint not found: {ckpt_path}")
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     trait_cols = ckpt.get("trait_cols", TRAIT_COLUMNS)
     dropout = ckpt.get("dropout", 0.1)
     if dropout_override >= 0:
         dropout = dropout_override
 
-    model = MultiTraitAESModel(dropout=dropout, num_traits=len(trait_cols))
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    model = MultiTraitAESModel(dropout=dropout, trait_names=trait_cols)
+    state_dict = ckpt["model_state_dict"]
+
+    # Backward-compatible path: initialize separate trait heads from the old shared regressor.
+    if any(k.startswith("regressor.") for k in state_dict.keys()) and not any(k.startswith("trait_heads.") for k in state_dict.keys()):
+        _init_separate_trait_heads_from_shared_regressor(model, state_dict, trait_cols)
+        encoder_state = {k: v for k, v in state_dict.items() if k.startswith("encoder.")}
+        missing, unexpected = model.load_state_dict(encoder_state, strict=False)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
     model.to(device)
     return model, trait_cols, ckpt
 
@@ -579,6 +672,8 @@ def apply_lora_to_encoder(
     bias: str = "none",
     use_rslora: bool = False,
     use_dora: bool = False,
+    layers_to_transform: Optional[List[int]] = None,
+    layers_pattern: Optional[str] = None,
 ):
     try:
         from peft import LoraConfig, TaskType, get_peft_model
@@ -587,7 +682,7 @@ def apply_lora_to_encoder(
             "PEFT is required for LoRA adaptation. Install it with: pip install peft"
         ) from exc
 
-    lora_config = LoraConfig(
+    lora_kwargs = dict(
         task_type=TaskType.FEATURE_EXTRACTION,
         inference_mode=False,
         r=r,
@@ -595,10 +690,15 @@ def apply_lora_to_encoder(
         lora_dropout=lora_dropout,
         target_modules=target_modules,
         bias=bias,
-        modules_to_save=["regressor"],   # keep scorer head trainable + savable for v2 run
-        use_rslora=use_rslora,           # optional rsLoRA for v2 run
-        use_dora=use_dora,           # optional DoRA for v4 run  
+        use_rslora=use_rslora,
+        use_dora=use_dora,
     )
+    if layers_to_transform is not None and len(layers_to_transform) > 0:
+        lora_kwargs["layers_to_transform"] = layers_to_transform
+    if layers_pattern is not None and len(layers_pattern) > 0:
+        lora_kwargs["layers_pattern"] = layers_pattern
+
+    lora_config = LoraConfig(**lora_kwargs)
     model.encoder = get_peft_model(model.encoder, lora_config)
     return model
 
@@ -607,19 +707,20 @@ def mark_only_lora_and_head_trainable(model: nn.Module):
     for p in model.parameters():
         p.requires_grad = False
 
-    # PeftModel already marks LoRA params trainable internally, but this keeps the
-    # behavior explicit and also ensures the scorer head remains trainable.
     for name, p in model.encoder.named_parameters():
         if "lora_" in name:
             p.requires_grad = True
 
-     # PEFT modules_to_save may appear under these names for v2 run
     for name, p in model.encoder.named_parameters():
         if "modules_to_save" in name:
             p.requires_grad = True
 
-    for p in model.regressor.parameters():
-        p.requires_grad = True
+    if hasattr(model, "trait_heads"):
+        for p in model.trait_heads.parameters():
+            p.requires_grad = True
+    elif hasattr(model, "regressor"):
+        for p in model.regressor.parameters():
+            p.requires_grad = True
 
 
 def count_parameters(model: nn.Module) -> Dict[str, int]:
@@ -629,11 +730,16 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
     return {"total": int(total), "trainable": int(trainable), "frozen": int(frozen)}
 
 
+def count_parameter_dict_params(param_dict: nn.ParameterDict) -> int:
+    return int(sum(p.numel() for p in param_dict.parameters()))
+
+
 def amp_context(device: torch.device):
     amp_enabled = device.type == "cuda"
     autocast_device = "cuda" if amp_enabled else "cpu"
     autocast_dtype = torch.float16 if amp_enabled else torch.bfloat16
     return amp_enabled, autocast_device, autocast_dtype
+
 
 def snapshot_trainable_state(model: nn.Module) -> Dict[str, torch.Tensor]:
     return {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
@@ -653,6 +759,31 @@ def reptile_meta_update_(model: nn.Module, start_state: Dict[str, torch.Tensor],
         start_tensor = start_tensor.to(param.device)
         param.data.copy_(start_tensor + step_size * (param.data - start_tensor))
 
-def mark_all_trainable(model: nn.Module):
-    for p in model.parameters():
-        p.requires_grad = True
+
+def alpha_key_from_param_name(name: str) -> str:
+    return name.replace(".", "__")
+
+
+def get_trainable_named_params(model: nn.Module) -> OrderedDict:
+    return OrderedDict((name, p) for name, p in model.named_parameters() if p.requires_grad)
+
+
+def build_meta_sgd_alpha(model: nn.Module, init_alpha: float = 1e-3) -> nn.ParameterDict:
+    alpha = nn.ParameterDict()
+    for name, p in get_trainable_named_params(model).items():
+        alpha[alpha_key_from_param_name(name)] = nn.Parameter(torch.full_like(p, init_alpha))
+    return alpha
+
+
+def clone_named_params(params: OrderedDict) -> OrderedDict:
+    return OrderedDict((name, tensor.detach().clone()) for name, tensor in params.items())
+
+
+def extract_alpha_state(alpha: nn.ParameterDict) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in alpha.items()}
+
+
+def load_alpha_state(alpha: nn.ParameterDict, state: Dict[str, torch.Tensor], device: torch.device):
+    for k, v in state.items():
+        if k in alpha:
+            alpha[k].data.copy_(v.to(device=device, dtype=alpha[k].dtype))

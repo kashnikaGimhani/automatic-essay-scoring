@@ -2,7 +2,6 @@ import os
 import math
 import argparse
 import pandas as pd
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -19,7 +18,6 @@ from utils import (
     TRAIT_COLUMNS,
     ensure_dir,
     save_json,
-    load_json,
     set_seed,
     normalize_prompt_id,
     parse_prompt_list,
@@ -28,43 +26,41 @@ from utils import (
     build_score_ranges_from_hardcoded,
     build_global_trait_fallback,
     AESDataset,
-    MultiTraitAESModel,
-    freeze_encoder_only,
     masked_regression_loss,
     evaluate,
     format_metrics_for_print,
-    get_range_for_trait,
-    denormalize_score,
-    round_to_step,
+    load_base_checkpoint_into_model,
+    count_parameters,
+    amp_context,
+    mark_all_trainable,
 )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Head-only adaptation on reusable few-shot target splits")
+    parser = argparse.ArgumentParser(description="Full fine-tuning adaptation on reusable few-shot target splits")
 
-    parser.add_argument("--data_path", type=str, required=True, help="Full original dataset; used only for global fallback ranges")
-    parser.add_argument("--split_root", type=str, required=True, help="Root directory created by create_target_fewshot_splits.py")
-    parser.add_argument("--base_root", type=str, required=True, help='Root containing base models, e.g. base_root/heldout_1/best_checkpoint')
+    parser.add_argument("--data_path", type=str, required=True, help="Full original dataset; used for fallback ranges")
+    parser.add_argument("--split_root", type=str, required=True, help="Root dir created by create_target_fewshot_splits.py")
+    parser.add_argument("--base_root", type=str, required=True, help="Root containing base checkpoints")
     parser.add_argument("--output_root", type=str, required=True)
 
     parser.add_argument("--sep", type=str, default="\t")
     parser.add_argument("--prompt_col", type=str, default="essay_set")
     parser.add_argument("--text_col", type=str, default="essay")
-    parser.add_argument("--id_col", type=str, default="essay_id")
 
     parser.add_argument("--heldout_prompts", type=str, default="all")
     parser.add_argument("--fewshot_sizes", type=str, default="8,16,32,64,128")
 
-    parser.add_argument("--max_length", type=int, default=480)
+    parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-3, help="Head-only LR can usually be higher than full FT")
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--dropout_override", type=float, default=-1.0, help="Use -1 to keep base checkpoint dropout")
+    parser.add_argument("--dropout_override", type=float, default=-1.0)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--patience", type=int, default=5)
 
@@ -76,31 +72,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_base_model(base_ckpt_dir: str, device: torch.device, dropout_override: float):
-    ckpt_path = os.path.join(base_ckpt_dir, "best_model.pt")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Base checkpoint not found: {ckpt_path}")
-
-    ckpt = torch.load(ckpt_path, map_location=device)
-    trait_cols = ckpt.get("trait_cols", TRAIT_COLUMNS)
-    dropout = ckpt.get("dropout", 0.1)
-    if dropout_override >= 0:
-        dropout = dropout_override
-
-    model = MultiTraitAESModel(
-        dropout=dropout,
-        num_traits=len(trait_cols),
-    )
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
-    model.to(device)
-    return model, trait_cols, ckpt
-
-
 def train_one_run(
     model,
     train_loader,
     dev_loader,
-    train_dataset,
     dev_dataset,
     trait_cols,
     score_ranges,
@@ -109,31 +84,27 @@ def train_one_run(
     args,
     run_dir,
 ):
-    freeze_encoder_only(model)
+    mark_all_trainable(model)
+    param_counts = count_parameters(model)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     total_update_steps = max(1, math.ceil(len(train_loader) / args.grad_accum_steps) * args.num_epochs)
     warmup_steps = int(total_update_steps * args.warmup_ratio)
-
     scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_update_steps,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    amp_enabled, autocast_device, autocast_dtype = amp_context(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_dev_qwk = -1e9
     best_epoch = -1
     early_stop_counter = 0
-    best_ckpt_path = os.path.join(run_dir, "best_head_only.pt")
-
+    best_ckpt_path = os.path.join(run_dir, "best_full_ft_model.pt")
     history = []
 
     for epoch in range(1, args.num_epochs + 1):
@@ -142,7 +113,6 @@ def train_one_run(
 
         running_loss = 0.0
         num_steps = 0
-
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.num_epochs}", leave=False)
 
         for step, batch in enumerate(progress, start=1):
@@ -150,14 +120,9 @@ def train_one_run(
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             label_mask = batch["label_mask"].to(device)
-            token_type_ids = batch["token_type_ids"].to(device) if "token_type_ids" in batch else None
 
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                preds = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                )
+            with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=amp_enabled):
+                preds = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = masked_regression_loss(
                     preds=preds,
                     targets=labels,
@@ -182,7 +147,6 @@ def train_one_run(
             progress.set_postfix(loss=f"{running_loss / max(num_steps, 1):.4f}")
 
         train_loss = running_loss / max(num_steps, 1)
-
         dev_metrics = evaluate(
             model=model,
             dataloader=dev_loader,
@@ -219,6 +183,7 @@ def train_one_run(
                     "best_epoch": best_epoch,
                     "best_dev_mean_qwk": best_dev_qwk,
                     "trait_cols": trait_cols,
+                    "param_counts": param_counts,
                 },
                 best_ckpt_path,
             )
@@ -230,128 +195,9 @@ def train_one_run(
 
     if os.path.exists(best_ckpt_path):
         best_state = torch.load(best_ckpt_path, map_location=device)
-        model.load_state_dict(best_state["model_state_dict"])
+        model.load_state_dict(best_state["model_state_dict"], strict=True)
 
-    return model, history, best_epoch, best_dev_qwk
-
-
-def predict_to_dataframe(
-    model,
-    dataloader,
-    dataset,
-    original_df,
-    trait_cols,
-    score_ranges,
-    global_trait_fallback,
-    device,
-    round_step,
-    id_col,
-    prompt_col,
-    text_col,
-):
-    """
-    Create a CSV-friendly dataframe containing target and predicted scores.
-
-    Output columns include:
-      - id/prompt/text columns when available
-      - target_<trait>
-      - pred_<trait>
-      - raw_pred_<trait>
-      - diff_<trait> = target_<trait> - pred_<trait>
-
-    The predicted score is denormalized, rounded using round_step, and clipped
-    to the valid score range for that prompt/trait, matching evaluate().
-    """
-    model.eval()
-
-    all_preds = []
-    all_labels = []
-    all_masks = []
-    all_indices = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            label_mask = batch["label_mask"].to(device)
-            idxs = batch["idx"].cpu().numpy()
-
-            token_type_ids = batch["token_type_ids"].to(device) if "token_type_ids" in batch else None
-
-            preds = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-            )
-
-            all_preds.append(preds.detach().cpu().numpy())
-            all_labels.append(labels.detach().cpu().numpy())
-            all_masks.append(label_mask.detach().cpu().numpy())
-            all_indices.append(idxs)
-
-    if not all_preds:
-        return pd.DataFrame()
-
-    preds_norm = np.concatenate(all_preds, axis=0)
-    labels_norm = np.concatenate(all_labels, axis=0)
-    masks = np.concatenate(all_masks, axis=0)
-    indices = np.concatenate(all_indices, axis=0)
-
-    # Restore original dataset order.
-    order = np.argsort(indices)
-    preds_norm = preds_norm[order]
-    labels_norm = labels_norm[order]
-    masks = masks[order]
-    indices = indices[order]
-
-    rows = []
-
-    for row_pos, ds_idx in enumerate(indices):
-        ds_idx = int(ds_idx)
-        pid = dataset.prompt_ids[ds_idx]
-
-        row = {}
-
-        if id_col in original_df.columns:
-            row[id_col] = original_df.iloc[ds_idx][id_col]
-        else:
-            row["row_idx"] = ds_idx
-
-        if prompt_col in original_df.columns:
-            row[prompt_col] = original_df.iloc[ds_idx][prompt_col]
-
-        if text_col in original_df.columns:
-            row[text_col] = original_df.iloc[ds_idx][text_col]
-
-        for j, trait in enumerate(trait_cols):
-            if masks[row_pos, j] < 0.5:
-                row[f"target_{trait}"] = ""
-                row[f"pred_{trait}"] = ""
-                row[f"raw_pred_{trait}"] = ""
-                row[f"diff_{trait}"] = ""
-                continue
-
-            rng = get_range_for_trait(score_ranges, pid, trait, global_trait_fallback)
-            mn, mx = rng["min"], rng["max"]
-
-            gold_raw = denormalize_score(labels_norm[row_pos, j], mn, mx)
-            pred_raw = denormalize_score(preds_norm[row_pos, j], mn, mx)
-
-            gold_rounded = round_to_step(gold_raw, round_step)
-            pred_rounded = round_to_step(pred_raw, round_step)
-
-            gold_rounded = float(np.clip(gold_rounded, mn, mx))
-            pred_rounded = float(np.clip(pred_rounded, mn, mx))
-
-            row[f"target_{trait}"] = gold_rounded
-            row[f"pred_{trait}"] = pred_rounded
-            row[f"raw_pred_{trait}"] = float(pred_raw)
-            row[f"diff_{trait}"] = gold_rounded - pred_rounded
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+    return model, history, best_epoch, best_dev_qwk, param_counts
 
 
 def main():
@@ -430,23 +276,10 @@ def main():
                 max_length=args.max_length,
             )
 
-            dev_loader = DataLoader(
-                dev_dataset,
-                batch_size=args.eval_batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=args.eval_batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
+            dev_loader = DataLoader(dev_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            test_loader = DataLoader(test_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-            # Optional zero-shot baseline before adaptation, saved once per repeat.
-            zero_model, zero_trait_cols, _ = load_base_model(
+            zero_model, zero_trait_cols, _ = load_base_checkpoint_into_model(
                 base_ckpt_dir=base_ckpt_dir,
                 device=device,
                 dropout_override=args.dropout_override,
@@ -478,40 +311,8 @@ def main():
 
             repeat_out_dir = os.path.join(args.output_root, f"heldout_{heldout_prompt}", repeat_name)
             ensure_dir(repeat_out_dir)
-
-            zero_dev_predictions = predict_to_dataframe(
-                model=zero_model,
-                dataloader=dev_loader,
-                dataset=dev_dataset,
-                original_df=dev_df,
-                trait_cols=zero_trait_cols,
-                score_ranges=score_ranges,
-                global_trait_fallback=global_trait_fallback,
-                device=device,
-                round_step=args.round_step,
-                id_col=args.id_col,
-                prompt_col=args.prompt_col,
-                text_col=args.text_col,
-            )
-            zero_test_predictions = predict_to_dataframe(
-                model=zero_model,
-                dataloader=test_loader,
-                dataset=test_dataset,
-                original_df=test_df,
-                trait_cols=zero_trait_cols,
-                score_ranges=score_ranges,
-                global_trait_fallback=global_trait_fallback,
-                device=device,
-                round_step=args.round_step,
-                id_col=args.id_col,
-                prompt_col=args.prompt_col,
-                text_col=args.text_col,
-            )
-
             save_json(zero_dev, os.path.join(repeat_out_dir, "zero_shot_dev_metrics.json"))
             save_json(zero_test, os.path.join(repeat_out_dir, "zero_shot_test_metrics.json"))
-            zero_dev_predictions.to_csv(os.path.join(repeat_out_dir, "zero_shot_dev_predictions.csv"), index=False)
-            zero_test_predictions.to_csv(os.path.join(repeat_out_dir, "zero_shot_test_predictions.csv"), index=False)
 
             print(format_metrics_for_print("Zero-shot dev", zero_dev))
             print(format_metrics_for_print("Zero-shot test", zero_test))
@@ -538,16 +339,9 @@ def main():
                     global_trait_fallback=global_trait_fallback,
                     max_length=args.max_length,
                 )
+                train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-                train_loader = DataLoader(
-                    train_dataset,
-                    batch_size=args.batch_size,
-                    shuffle=True,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                )
-
-                model, trait_cols, base_ckpt_meta = load_base_model(
+                model, trait_cols, _ = load_base_checkpoint_into_model(
                     base_ckpt_dir=base_ckpt_dir,
                     device=device,
                     dropout_override=args.dropout_override,
@@ -556,11 +350,10 @@ def main():
                 run_dir = os.path.join(repeat_out_dir, f"k_{k}")
                 ensure_dir(run_dir)
 
-                model, history, best_epoch, best_dev_qwk = train_one_run(
+                model, history, best_epoch, best_dev_qwk, param_counts = train_one_run(
                     model=model,
                     train_loader=train_loader,
                     dev_loader=dev_loader,
-                    train_dataset=train_dataset,
                     dev_dataset=dev_dataset,
                     trait_cols=trait_cols,
                     score_ranges=score_ranges,
@@ -595,40 +388,9 @@ def main():
                     huber_delta=args.huber_delta,
                 )
 
-                final_dev_predictions = predict_to_dataframe(
-                    model=model,
-                    dataloader=dev_loader,
-                    dataset=dev_dataset,
-                    original_df=dev_df,
-                    trait_cols=trait_cols,
-                    score_ranges=score_ranges,
-                    global_trait_fallback=global_trait_fallback,
-                    device=device,
-                    round_step=args.round_step,
-                    id_col=args.id_col,
-                    prompt_col=args.prompt_col,
-                    text_col=args.text_col,
-                )
-                final_test_predictions = predict_to_dataframe(
-                    model=model,
-                    dataloader=test_loader,
-                    dataset=test_dataset,
-                    original_df=test_df,
-                    trait_cols=trait_cols,
-                    score_ranges=score_ranges,
-                    global_trait_fallback=global_trait_fallback,
-                    device=device,
-                    round_step=args.round_step,
-                    id_col=args.id_col,
-                    prompt_col=args.prompt_col,
-                    text_col=args.text_col,
-                )
-
-                save_json(history and {"history": history} or {"history": []}, os.path.join(run_dir, "training_history.json"))
+                save_json({"history": history}, os.path.join(run_dir, "training_history.json"))
                 save_json(final_dev, os.path.join(run_dir, "final_dev_metrics.json"))
                 save_json(final_test, os.path.join(run_dir, "final_test_metrics.json"))
-                final_dev_predictions.to_csv(os.path.join(run_dir, "final_dev_predictions.csv"), index=False)
-                final_test_predictions.to_csv(os.path.join(run_dir, "final_test_predictions.csv"), index=False)
                 save_json(
                     {
                         "heldout_prompt": heldout_prompt,
@@ -637,6 +399,7 @@ def main():
                         "best_epoch": best_epoch,
                         "best_dev_mean_qwk": best_dev_qwk,
                         "base_checkpoint_dir": base_ckpt_dir,
+                        "param_counts": param_counts,
                         "train_n": len(train_df),
                         "dev_n": len(dev_df),
                         "test_n": len(test_df),
@@ -646,7 +409,8 @@ def main():
                     os.path.join(run_dir, "run_config.json"),
                 )
 
-                print(f"\nHead-only | heldout={heldout_prompt} | {repeat_name} | k={k}")
+                print(f"\nFull FT | heldout={heldout_prompt} | {repeat_name} | k={k}")
+                print(f"Trainable params: {param_counts['trainable']:,} / {param_counts['total']:,}")
                 print(format_metrics_for_print("Final dev", final_dev))
                 print(format_metrics_for_print("Final test", final_test))
 
@@ -666,12 +430,13 @@ def main():
                         "final_test_mean_rmse": final_test["mean_rmse"],
                         "zero_shot_test_mean_qwk": zero_test["mean_qwk"],
                         "zero_shot_test_mean_rmse": zero_test["mean_rmse"],
+                        "trainable_params": param_counts["trainable"],
+                        "total_params": param_counts["total"],
                     }
                 )
 
     if summary_rows:
-        summary_df = pd.DataFrame(summary_rows)
-        summary_df.to_csv(os.path.join(args.output_root, "head_only_summary.csv"), index=False)
+        pd.DataFrame(summary_rows).to_csv(os.path.join(args.output_root, "full_ft_summary.csv"), index=False)
 
     print("\nDone.")
 

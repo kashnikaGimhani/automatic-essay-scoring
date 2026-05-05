@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--dev_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--max_length", type=int, default=768)
+    parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=10)

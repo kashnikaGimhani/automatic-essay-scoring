@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=BASE_AES
-#SBATCH -o base_aes.out
-#SBATCH -e base_aes.err
-#SBATCH --partition=gpu
+#SBATCH --job-name=FILM_ADAPTOR
+#SBATCH -o film_adaptor.out
+#SBATCH -e film_adaptor.err
+#SBATCH --partition=bigmem
 #SBATCH --gres=gpu:1
 #SBATCH --mem=60G
 #SBATCH --time=08:00:00
@@ -20,15 +20,14 @@ module load Python/3.9.6
 source mytest/bin/activate
 export PYTHONUNBUFFERED=1
 
-python3 base_aes.py \
+python3 FILM/adaptor.py \
   --data_path ../data/asap_train_with_all_traits.tsv \
-  --output_dir outputs/base_prompt2 \
   --heldout_prompt 2 \
-  --sep $'\t' \
-  --num_epochs 10 \
-  --batch_size 4 \
-  --eval_batch_size 8 \
-  --max_length 480 \
-  --dev_ratio 0.1 \
-  --save_split_files \
-  --run_zero_shot_eval
+  --output_dir FILM/heldout_2 \
+  --model_name roberta-base \
+  --epochs 5 \
+  --batch_size 8 \
+  --exclude_columns target overall \
+  --prompt_meta_json ../data/asap_prompt_meta.json \
+  --score_range_json ../data/asap_score_ranges.json \
+  --match_loss_weight 0.1
